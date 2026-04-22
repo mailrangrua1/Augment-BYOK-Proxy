@@ -1,20 +1,20 @@
-name: Auto Build & Release
+name: Auto Build & Release Modified VSIX
 
 permissions:
   contents: write
 
 on:
-  # Định kỳ mỗi 6 giờ kiểm tra Marketplace có phiên bản mới không
+  # Check Marketplace for new version every 6 hours
   schedule:
     - cron: "0 */6 * * *"
-  # Push vào main cũng trigger (ví dụ cập nhật inject code)
+  # Also trigger on push to main (e.g. inject code updates)
   push:
     branches: [main]
-  # Cho phép chạy thủ công
+  # Allow manual trigger
   workflow_dispatch:
     inputs:
       force_build:
-        description: "Bỏ qua kiểm tra version, build bắt buộc"
+        description: "Skip version check, force rebuild"
         required: false
         default: "false"
         type: choice
@@ -27,7 +27,7 @@ concurrency:
 # ─────────────────────────────────────────────────────────────
 jobs:
 
-  # ── 1. Kiểm tra phiên bản Marketplace vs GitHub Releases ──
+  # ── 1. Check Marketplace version vs existing GitHub Releases ──
   check-version:
     runs-on: ubuntu-latest
     outputs:
@@ -38,7 +38,6 @@ jobs:
         id: query
         run: |
           set -euo pipefail
-          # Dùng VS Marketplace Gallery API để lấy version mới nhất
           PAYLOAD='{"filters":[{"criteria":[{"filterType":7,"value":"augment.vscode-augment"}],"pageNumber":1,"pageSize":1}],"flags":914}'
           RESP=$(curl -sf -X POST \
             -H "Content-Type: application/json" \
@@ -48,7 +47,7 @@ jobs:
 
           VERSION=$(echo "$RESP" | jq -r '.results[0].extensions[0].versions[0].version // empty')
           if [ -z "$VERSION" ]; then
-            echo "::error::Không thể lấy version từ Marketplace API"
+            echo "::error::Failed to query version from Marketplace API"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -70,20 +69,20 @@ jobs:
             exit 0
           fi
 
-          # Kiểm tra tag đã tồn tại trên GitHub chưa
+          # Check if this version tag already exists on GitHub
           HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")
 
           if [ "$HTTP" = "200" ]; then
-            echo "✓ Release ${TAG} đã tồn tại → skip build"
+            echo "✓ Release ${TAG} already exists → skip build"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "✓ Release ${TAG} chưa tồn tại → sẽ build"
+            echo "✓ Release ${TAG} not found → will build"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # ── 2. Build VSIX đã inject ──────────────────────────────
+  # ── 2. Build injected VSIX ────────────────────────────────
   build-vsix:
     needs: check-version
     if: needs.check-version.outputs.should_build == 'true'
@@ -104,7 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/repack_vsix.py --force
-          # Lấy version từ tên file output
+          # Extract version from output filename
           VSIX_FILE=$(ls dist/augment-vscode-modified-v*.vsix | head -1)
           VERSION=$(echo "$VSIX_FILE" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -127,93 +126,16 @@ jobs:
             dist/*.sha256
           retention-days: 30
 
-  # ── 3. Build Rust Proxy (multi-platform) ──────────────────
-  build-proxy:
-    needs: check-version
-    if: needs.check-version.outputs.should_build == 'true'
-    name: Build Proxy (${{ matrix.folder }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            bin: augment-byok-proxy
-            folder: augment-byok-proxy-macos-aarch64
-            archive: augment-byok-proxy-macos-aarch64.tar.gz
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            bin: augment-byok-proxy
-            folder: augment-byok-proxy-macos-x86_64
-            archive: augment-byok-proxy-macos-x86_64.tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: augment-byok-proxy.exe
-            folder: augment-byok-proxy-windows-x86_64
-            archive: augment-byok-proxy-windows-x86_64.zip
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build (release)
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          set -euxo pipefail
-          folder="${{ matrix.folder }}"
-          mkdir -p "dist/${folder}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${folder}/"
-          cp "config.example.yaml" "dist/${folder}/config.yaml"
-          cp "README.md" "dist/${folder}/"
-          (cd dist && tar -czf "${{ matrix.archive }}" "${folder}")
-          sha256sum "dist/${{ matrix.archive }}" | awk '{print $1}' > "dist/${{ matrix.archive }}.sha256"
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $folder = "${{ matrix.folder }}"
-          New-Item -ItemType Directory -Force -Path "dist/$folder" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$folder/${{ matrix.bin }}" -Force
-          Copy-Item "config.example.yaml" "dist/$folder/config.yaml" -Force
-          Copy-Item "README.md" "dist/$folder/README.md" -Force
-          Compress-Archive -Path "dist/$folder" -DestinationPath "dist/${{ matrix.archive }}" -Force
-          (Get-FileHash "dist/${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower() | Out-File -Encoding ascii "dist/${{ matrix.archive }}.sha256"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.folder }}
-          path: |
-            dist/${{ matrix.archive }}
-            dist/${{ matrix.archive }}.sha256
-          if-no-files-found: error
-          retention-days: 30
-
-  # ── 4. Tạo GitHub Release (versioned + rolling) ──────────
+  # ── 3. Create GitHub Release (versioned + rolling) ────────
   release:
     name: GitHub Release
-    needs: [check-version, build-vsix, build-proxy]
+    needs: [check-version, build-vsix]
     if: needs.check-version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.build-vsix.outputs.version }}
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
@@ -222,44 +144,34 @@ jobs:
       - name: List artifacts
         run: ls -lhR dist
 
-      # ── 4a. Versioned release (vsix-v0.840.7) ──
+      # ── 3a. Versioned release (vsix-v0.840.7) ──
       - name: Create versioned release
         uses: ncipollo/release-action@v1
         with:
           tag: "vsix-v${{ env.VERSION }}"
-          name: "Augment BYOK Proxy — VSIX v${{ env.VERSION }}"
+          name: "Modified VSIX v${{ env.VERSION }}"
           prerelease: false
           allowUpdates: false
           skipIfReleaseExists: true
           body: |
-            ## 🚀 Tự động build khi phát hiện phiên bản mới trên Marketplace
+            ## 🚀 Auto-built when new Marketplace version detected
 
-            **VSIX Version:** `v${{ env.VERSION }}` (từ `augment.vscode-augment`)
+            **VSIX Version:** `v${{ env.VERSION }}` (from `augment.vscode-augment`)
             **Commit:** `${{ github.sha }}`
-            **Build time:** `${{ github.run_id }}`
+            **Build:** `${{ github.run_id }}`
 
-            ### 📦 Files
-            - `augment-vscode-modified-v${{ env.VERSION }}.vsix` — Extension đã inject (BYOK Proxy Panel + Auth Header + Interceptor)
-            - `augment-byok-proxy-*` — Rust proxy binary (macOS/Linux/Windows)
+            ### 📦 What's included
+            - `augment-vscode-modified-v${{ env.VERSION }}.vsix` — Extension with injected BYOK Proxy Panel + Auth Header + Interceptor
 
-            ### 📥 Cài đặt VSIX
-            1. Download file `.vsix` bên dưới
+            ### 📥 Installation
+            1. Download the `.vsix` file below
             2. VS Code → Extensions → `⋯` → **Install from VSIX…**
-            3. Chọn file vừa tải
-
-            ### ⚙️ Cài đặt Proxy
-            1. Download archive phù hợp OS
-            2. Giải nén, chỉnh `config.yaml`
-            3. Chạy `./augment-byok-proxy`
+            3. Select the downloaded file
           artifacts: |
             dist/*.vsix
             dist/*.vsix.sha256
-            dist/*.zip
-            dist/*.zip.sha256
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
 
-      # ── 4b. Rolling release (luôn cập nhật bản mới nhất) ──
+      # ── 3b. Rolling release (always points to latest) ──
       - name: Update rolling release
         uses: ncipollo/release-action@v1
         with:
@@ -269,17 +181,12 @@ jobs:
           allowUpdates: true
           replacesArtifacts: true
           body: |
-            ⚡ **Bản build mới nhất** — tự động cập nhật khi Marketplace có phiên bản mới.
+            ⚡ **Latest build** — automatically updated when a new Marketplace version is detected.
 
             - **VSIX:** `augment.vscode-augment` v${{ env.VERSION }}
-            - **Proxy:** Rust pre-built (macOS aarch64/x86_64, Windows x86_64)
             - **Commit:** ${{ github.sha }}
 
-            > Nếu cần bản cụ thể, xem [Releases](../../releases) để tìm tag `vsix-v*`.
+            > For a specific version, check [Releases](../../releases) for `vsix-v*` tags.
           artifacts: |
             dist/*.vsix
             dist/*.vsix.sha256
-            dist/*.zip
-            dist/*.zip.sha256
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
