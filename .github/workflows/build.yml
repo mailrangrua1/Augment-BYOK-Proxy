@@ -147,11 +147,6 @@ jobs:
             bin: augment-byok-proxy
             folder: augment-byok-proxy-macos-x86_64
             archive: augment-byok-proxy-macos-x86_64.tar.gz
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: augment-byok-proxy
-            folder: augment-byok-proxy-linux-x86_64
-            archive: augment-byok-proxy-linux-x86_64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: augment-byok-proxy.exe
@@ -277,7 +272,7 @@ jobs:
             ⚡ **Bản build mới nhất** — tự động cập nhật khi Marketplace có phiên bản mới.
 
             - **VSIX:** `augment.vscode-augment` v${{ env.VERSION }}
-            - **Proxy:** Rust pre-built (macOS aarch64/x86_64, Linux x86_64, Windows x86_64)
+            - **Proxy:** Rust pre-built (macOS aarch64/x86_64, Windows x86_64)
             - **Commit:** ${{ github.sha }}
 
             > Nếu cần bản cụ thể, xem [Releases](../../releases) để tìm tag `vsix-v*`.
