@@ -1,241 +1,137 @@
-name: build-release
+name: Auto Build & Release
 
 permissions:
   contents: write
 
 on:
+  # Định kỳ mỗi 6 giờ kiểm tra Marketplace có phiên bản mới không
+  schedule:
+    - cron: "0 */6 * * *"
+  # Push vào main cũng trigger (ví dụ cập nhật inject code)
   push:
     branches: [main]
-  schedule:
-    - cron: "0 */8 * * *"  # 每8小时执行一次
-  workflow_dispatch: {}
+  # Cho phép chạy thủ công
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Bỏ qua kiểm tra version, build bắt buộc"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 concurrency:
-  group: build-release
+  group: auto-build-release
   cancel-in-progress: true
 
+# ─────────────────────────────────────────────────────────────
 jobs:
-  modify-extension:
+
+  # ── 1. Kiểm tra phiên bản Marketplace vs GitHub Releases ──
+  check-version:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.get_version.outputs.version }}
-    
+      should_build: ${{ steps.decide.outputs.should_build }}
+      marketplace_version: ${{ steps.query.outputs.version }}
+    steps:
+      - name: Query Marketplace latest version
+        id: query
+        run: |
+          set -euo pipefail
+          # Dùng VS Marketplace Gallery API để lấy version mới nhất
+          PAYLOAD='{"filters":[{"criteria":[{"filterType":7,"value":"augment.vscode-augment"}],"pageNumber":1,"pageSize":1}],"flags":914}'
+          RESP=$(curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            -d "$PAYLOAD" \
+            "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery")
+
+          VERSION=$(echo "$RESP" | jq -r '.results[0].extensions[0].versions[0].version // empty')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Không thể lấy version từ Marketplace API"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "✓ Marketplace version: $VERSION"
+
+      - name: Compare with existing releases
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force_build || 'false' }}
+          MKT_VERSION: ${{ steps.query.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="vsix-v${MKT_VERSION}"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "⚡ Force build requested"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Kiểm tra tag đã tồn tại trên GitHub chưa
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")
+
+          if [ "$HTTP" = "200" ]; then
+            echo "✓ Release ${TAG} đã tồn tại → skip build"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✓ Release ${TAG} chưa tồn tại → sẽ build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── 2. Build VSIX đã inject ──────────────────────────────
+  build-vsix:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.repack.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
+          python-version: "3.12"
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      - name: Install required tools
+      - name: Build modified VSIX (repack_vsix.py)
+        id: repack
         run: |
-          npm install -g @vscode/vsce
-          sudo apt-get update
-          sudo apt-get install -y jq unzip
+          set -euo pipefail
+          python3 scripts/repack_vsix.py --force
+          # Lấy version từ tên file output
+          VSIX_FILE=$(ls dist/augment-vscode-modified-v*.vsix | head -1)
+          VERSION=$(echo "$VSIX_FILE" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "vsix_file=$VSIX_FILE" >> "$GITHUB_OUTPUT"
+          echo "✓ Built: $VSIX_FILE (v$VERSION)"
 
-      - name: Download Latest VSIX
+      - name: Generate SHA256
         run: |
-          PUBLISHER="augment"
-          EXTENSION_NAME="vscode-augment"
-          VSIX_URL="https://marketplace.visualstudio.com/_apis/public/gallery/publishers/${PUBLISHER}/vsextensions/${EXTENSION_NAME}/latest/vspackage"
-          curl -L --compressed -o original.vsix "${VSIX_URL}"
-          echo "VSIX downloaded successfully."
+          cd dist
+          for f in *.vsix; do
+            sha256sum "$f" | awk '{print $1}' > "${f}.sha256"
+          done
 
-      - name: Unpack VSIX
-        run: |
-          unzip -q original.vsix -d unpacked_ext
-          chmod -R u+w unpacked_ext
-          echo "VSIX unpacked successfully."
-
-      - name: Get extension version
-        id: get_version
-        run: |
-          VERSION=$(jq -r .version unpacked_ext/extension/package.json)
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Discovered extension version: ${VERSION}"
-
-      - name: Find main entry file and variables
-        run: |
-          # 查找主入口文件
-          MAIN_FILE=""
-          
-          # 尝试从 package.json 获取主入口文件
-          if [ -f "unpacked_ext/extension/package.json" ]; then
-            MAIN_ENTRY=$(jq -r '.main // empty' unpacked_ext/extension/package.json)
-            if [ -n "$MAIN_ENTRY" ] && [ -f "unpacked_ext/extension/$MAIN_ENTRY" ]; then
-              MAIN_FILE="unpacked_ext/extension/$MAIN_ENTRY"
-            fi
-          fi
-          
-          # 如果没找到，搜索包含特定模式的 JS 文件
-          if [ -z "$MAIN_FILE" ]; then
-            for file in $(find unpacked_ext/extension -name "*.js" -type f); do
-              if grep -q "handleAuthURI\|augment\.sessions" "$file" 2>/dev/null; then
-                MAIN_FILE="$file"
-                break
-              fi
-            done
-          fi
-          
-          # 如果还是没找到，使用第一个 JS 文件
-          if [ -z "$MAIN_FILE" ]; then
-            MAIN_FILE=$(find unpacked_ext/extension -name "*.js" -type f | head -1)
-          fi
-          
-          if [ -z "$MAIN_FILE" ]; then
-            echo "Error: No suitable JavaScript file found"
-            exit 1
-          fi
-          
-          echo "Found main file: $MAIN_FILE"
-          
-          # 备份原文件
-          cp "$MAIN_FILE" "${MAIN_FILE}.backup"
-          
-          # 查找变量名
-          SESSIONS_VAR=$(grep -o '[a-zA-Z_$][a-zA-Z0-9_$]*\s*=\s*"augment\.sessions"' "$MAIN_FILE" | sed 's/\s*=.*$//' | head -1)
-          EMAIL_VAR=$(grep -o '[a-zA-Z_$][a-zA-Z0-9_$]*\s*=\s*\["email"\]' "$MAIN_FILE" | sed 's/\s*=.*$//' | head -1)
-          
-          if [ -z "$SESSIONS_VAR" ] || [ -z "$EMAIL_VAR" ]; then
-            echo "Warning: Could not find required variable patterns, using fallback search"
-            # 尝试更宽松的搜索
-            SESSIONS_VAR=$(grep -o '[a-zA-Z_$][a-zA-Z0-9_$]*' "$MAIN_FILE" | grep -B5 -A5 "augment.sessions" | head -1)
-            EMAIL_VAR=$(grep -o '[a-zA-Z_$][a-zA-Z0-9_$]*' "$MAIN_FILE" | grep -B5 -A5 "email" | head -1)
-          fi
-          
-          # 如果还是找不到，使用默认值
-          if [ -z "$SESSIONS_VAR" ]; then
-            SESSIONS_VAR="x"
-          fi
-          if [ -z "$EMAIL_VAR" ]; then
-            EMAIL_VAR="y"
-          fi
-          
-          echo "Found sessions variable: $SESSIONS_VAR"
-          echo "Found email variable: $EMAIL_VAR"
-          
-          # 保存到环境变量
-          echo "SESSIONS_VAR=$SESSIONS_VAR" >> $GITHUB_ENV
-          echo "EMAIL_VAR=$EMAIL_VAR" >> $GITHUB_ENV
-          echo "MAIN_FILE=$MAIN_FILE" >> $GITHUB_ENV
-
-      - name: Apply modifications
-        run: |
-          echo "Applying modifications to $MAIN_FILE"
-
-          # 创建修改脚本
-          cat > modify_script.js << 'EOF'
-          const fs = require('fs');
-          const path = process.argv[2];
-          const sessionsVar = process.argv[3];
-          const emailVar = process.argv[4];
-
-          let content = fs.readFileSync(path, 'utf8');
-
-          // 0. 插入文件头代码（inject-code + byok proxy auth header + byok proxy panel）
-          let header = '';
-          const injectCodePath = 'vsix-patch/inject-code.txt';
-          if (fs.existsSync(injectCodePath)) {
-            header += fs.readFileSync(injectCodePath, 'utf8') + '\n;\n';
-            console.log(`✓ Injected header code from ${injectCodePath}`);
-          } else {
-            console.log(`ℹ ${injectCodePath} not found, skipping header injection`);
-          }
-          const authHeaderCodePath = 'vsix-patch/byok-proxy-auth-header-inject.js';
-          if (fs.existsSync(authHeaderCodePath)) {
-            header += fs.readFileSync(authHeaderCodePath, 'utf8') + '\n;\n';
-            console.log(`✓ Injected byok proxy auth header code from ${authHeaderCodePath}`);
-          } else {
-            throw new Error(`byok proxy auth header inject not found: ${authHeaderCodePath}`);
-          }
-          const panelCodePath = 'vsix-patch/byok-proxy-panel-inject.js';
-          if (fs.existsSync(panelCodePath)) {
-            header += fs.readFileSync(panelCodePath, 'utf8') + '\n;\n';
-            console.log(`✓ Injected byok proxy panel code from ${panelCodePath}`);
-          } else {
-            throw new Error(`byok proxy panel inject not found: ${panelCodePath}`);
-          }
-          if (header) content = header + content;
-
-          // 0.1 patch package.json：加入命令条目（让命令出现在命令面板）
-          try {
-            const cmdId = 'vscode-augment.byokProxy.settings';
-            const pathMod = require('path');
-            const pkg1 = pathMod.resolve(pathMod.dirname(path), '..', 'package.json');
-            const pkg2 = 'unpacked_ext/extension/package.json';
-            const pkgPath = fs.existsSync(pkg1) ? pkg1 : pkg2;
-            if (!fs.existsSync(pkgPath)) throw new Error(`package.json not found: ${pkgPath}`);
-            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-            pkg.contributes = pkg.contributes && typeof pkg.contributes === 'object' ? pkg.contributes : {};
-            pkg.contributes.commands = Array.isArray(pkg.contributes.commands) ? pkg.contributes.commands : [];
-            if (!pkg.contributes.commands.some((c) => c && typeof c === 'object' && c.command === cmdId)) {
-              pkg.contributes.commands.unshift({ category: 'Augment', command: cmdId, title: 'BYOK Proxy: Settings...' });
-              console.log(`✓ Patched package.json contributes.commands: ${cmdId}`);
-            }
-            pkg.activationEvents = Array.isArray(pkg.activationEvents) ? pkg.activationEvents : [];
-            const ev = `onCommand:${cmdId}`;
-            if (!pkg.activationEvents.includes(ev)) {
-              pkg.activationEvents.push(ev);
-              console.log(`✓ Patched package.json activationEvents: ${ev}`);
-            }
-            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
-          } catch (e) {
-            console.log(`⚠ package.json patch failed: ${e && e.message ? e.message : e}`);
-          }
-          fs.writeFileSync(path, content);
-          console.log('Modifications completed');
-          EOF
-          
-          # 运行修改脚本
-          node modify_script.js "$MAIN_FILE" "$SESSIONS_VAR" "$EMAIL_VAR"
-
-      - name: Verify modifications
-        run: |
-          echo "Verifying modifications..."
-
-          # 检查 byok proxy auth header 是否注入成功
-          if grep -q "__augment_byok_proxy_auth_header_injected" "$MAIN_FILE"; then
-            echo "✓ byok proxy auth header injected successfully"
-          else
-            echo "✗ Failed to inject byok proxy auth header"
-            exit 1
-          fi
-
-          # 检查 byok proxy panel 是否注入成功
-          if grep -q "__augment_byok_proxy_panel_injected" "$MAIN_FILE"; then
-            echo "✓ byok proxy panel injected successfully"
-          else
-            echo "✗ Failed to inject byok proxy panel"
-            exit 1
-          fi
-          
-          echo "All modifications verified successfully"
-
-
-
-      - name: Repack VSIX
-        run: |
-          cd unpacked_ext
-          # 重新打包为 VSIX
-          zip -r "../augment-vscode-modified-v${{ env.VERSION }}.vsix" . -x "*.git*"
-          cd ..
-          echo "VSIX repacked successfully as augment-vscode-modified-v${{ env.VERSION }}.vsix"
-
-      - name: Upload modified VSIX
+      - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
         with:
-          name: augment-vscode-modified-v${{ env.VERSION }}
-          path: augment-vscode-modified-v${{ env.VERSION }}.vsix
+          name: modified-vsix
+          path: |
+            dist/*.vsix
+            dist/*.sha256
           retention-days: 30
 
+  # ── 3. Build Rust Proxy (multi-platform) ──────────────────
   build-proxy:
-    name: Build Proxy ${{ matrix.folder }}
-    needs: modify-extension
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    name: Build Proxy (${{ matrix.folder }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -251,6 +147,11 @@ jobs:
             bin: augment-byok-proxy
             folder: augment-byok-proxy-macos-x86_64
             archive: augment-byok-proxy-macos-x86_64.tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: augment-byok-proxy
+            folder: augment-byok-proxy-linux-x86_64
+            archive: augment-byok-proxy-linux-x86_64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: augment-byok-proxy.exe
@@ -274,8 +175,8 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           set -euxo pipefail
           folder="${{ matrix.folder }}"
@@ -284,7 +185,7 @@ jobs:
           cp "config.example.yaml" "dist/${folder}/config.yaml"
           cp "README.md" "dist/${folder}/"
           (cd dist && tar -czf "${{ matrix.archive }}" "${folder}")
-          shasum -a 256 "dist/${{ matrix.archive }}" | awk '{print $1}' > "dist/${{ matrix.archive }}.sha256"
+          sha256sum "dist/${{ matrix.archive }}" | awk '{print $1}' > "dist/${{ matrix.archive }}.sha256"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -308,39 +209,82 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # ── 4. Tạo GitHub Release (versioned + rolling) ──────────
   release:
     name: GitHub Release
-    needs:
-      - modify-extension
-      - build-proxy
-    if: github.ref == 'refs/heads/main'
+    needs: [check-version, build-vsix, build-proxy]
+    if: needs.check-version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build-vsix.outputs.version }}
     steps:
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
       - name: List artifacts
-        run: ls -la dist
+        run: ls -lhR dist
 
-      - name: Publish Rolling Release
+      # ── 4a. Versioned release (vsix-v0.840.7) ──
+      - name: Create versioned release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "vsix-v${{ env.VERSION }}"
+          name: "Augment BYOK Proxy — VSIX v${{ env.VERSION }}"
+          prerelease: false
+          allowUpdates: false
+          skipIfReleaseExists: true
+          body: |
+            ## 🚀 Tự động build khi phát hiện phiên bản mới trên Marketplace
+
+            **VSIX Version:** `v${{ env.VERSION }}` (từ `augment.vscode-augment`)
+            **Commit:** `${{ github.sha }}`
+            **Build time:** `${{ github.run_id }}`
+
+            ### 📦 Files
+            - `augment-vscode-modified-v${{ env.VERSION }}.vsix` — Extension đã inject (BYOK Proxy Panel + Auth Header + Interceptor)
+            - `augment-byok-proxy-*` — Rust proxy binary (macOS/Linux/Windows)
+
+            ### 📥 Cài đặt VSIX
+            1. Download file `.vsix` bên dưới
+            2. VS Code → Extensions → `⋯` → **Install from VSIX…**
+            3. Chọn file vừa tải
+
+            ### ⚙️ Cài đặt Proxy
+            1. Download archive phù hợp OS
+            2. Giải nén, chỉnh `config.yaml`
+            3. Chạy `./augment-byok-proxy`
+          artifacts: |
+            dist/*.vsix
+            dist/*.vsix.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+
+      # ── 4b. Rolling release (luôn cập nhật bản mới nhất) ──
+      - name: Update rolling release
         uses: ncipollo/release-action@v1
         with:
           tag: rolling
-          name: Rolling
+          name: "Rolling — Latest (v${{ env.VERSION }})"
           prerelease: true
           allowUpdates: true
           replacesArtifacts: true
           body: |
-            自动构建（push/schedule/手动触发）。
+            ⚡ **Bản build mới nhất** — tự động cập nhật khi Marketplace có phiên bản mới.
 
-            - VSIX：基于 marketplace augment/vscode-augment v${{ needs.modify-extension.outputs.version }}
-            - Proxy：Rust 预编译（macOS/Windows）
-            - Commit: ${{ github.sha }}
+            - **VSIX:** `augment.vscode-augment` v${{ env.VERSION }}
+            - **Proxy:** Rust pre-built (macOS aarch64/x86_64, Linux x86_64, Windows x86_64)
+            - **Commit:** ${{ github.sha }}
+
+            > Nếu cần bản cụ thể, xem [Releases](../../releases) để tìm tag `vsix-v*`.
           artifacts: |
             dist/*.vsix
+            dist/*.vsix.sha256
             dist/*.zip
+            dist/*.zip.sha256
             dist/*.tar.gz
-            dist/*.sha256
+            dist/*.tar.gz.sha256
