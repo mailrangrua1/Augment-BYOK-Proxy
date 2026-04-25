@@ -1,105 +1,14 @@
-name: Auto Build & Release
+name: Build & Update VSIX
 
 permissions:
   contents: write
 
 on:
-  # Check Marketplace for new stable version every 6 hours
-  schedule:
-    - cron: "0 */6 * * *"
-  push:
-    branches: [main]
   workflow_dispatch:
-    inputs:
-      force_build:
-        description: "Skip version check, force rebuild"
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
 
-concurrency:
-  group: auto-build-release
-  cancel-in-progress: true
-
-# ─────────────────────────────────────────────────────────────
 jobs:
-
-  # ── 1. Check latest STABLE version on Marketplace ─────────
-  check-version:
-    runs-on: ubuntu-latest
-    outputs:
-      should_build: ${{ steps.decide.outputs.should_build }}
-      marketplace_version: ${{ steps.query.outputs.version }}
-    steps:
-      - name: Query Marketplace latest stable version
-        id: query
-        run: |
-          set -euo pipefail
-          # flags=914 includes version list; we filter out pre-release below
-          PAYLOAD='{"filters":[{"criteria":[{"filterType":7,"value":"augment.vscode-augment"}],"pageNumber":1,"pageSize":1}],"flags":914}'
-          RESP=$(curl -sf -X POST \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json;api-version=6.0-preview.1" \
-            -d "$PAYLOAD" \
-            "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery")
-
-          # Pick the first version that does NOT have the PreRelease property
-          VERSION=$(echo "$RESP" | jq -r '
-            [ .results[0].extensions[0].versions[]
-              | select(
-                  (.properties // [] | map(select(.key == "Microsoft.VisualStudio.Code.PreRelease" and .value == "true")) | length) == 0
-                )
-              | .version
-            ] | first // empty')
-
-          if [ -z "$VERSION" ]; then
-            echo "::warning::Pre-release filter returned empty, falling back to latest"
-            VERSION=$(echo "$RESP" | jq -r '.results[0].extensions[0].versions[0].version // empty')
-          fi
-
-          if [ -z "$VERSION" ]; then
-            echo "::error::Failed to query version from Marketplace API"
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "✓ Marketplace stable version: $VERSION"
-
-      - name: Compare with existing releases
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FORCE: ${{ inputs.force_build || 'false' }}
-          MKT_VERSION: ${{ steps.query.outputs.version }}
-        run: |
-          set -euo pipefail
-          TAG="vsix-v${MKT_VERSION}"
-
-          if [ "$FORCE" = "true" ]; then
-            echo "⚡ Force build requested"
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")
-
-          if [ "$HTTP" = "200" ]; then
-            echo "✓ Release ${TAG} already exists → skip"
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "✓ Release ${TAG} not found → will build"
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  # ── 2. Build injected VSIX ────────────────────────────────
   build-vsix:
-    needs: check-version
-    if: needs.check-version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.repack.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -110,189 +19,24 @@ jobs:
           python-version: "3.12"
 
       - name: Build modified VSIX
-        id: repack
+        id: build
         run: |
           set -euo pipefail
           python3 scripts/repack_vsix.py --force
           VSIX_FILE=$(ls dist/augment-vscode-modified-v*.vsix | head -1)
-          VERSION=$(echo "$VSIX_FILE" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+')
+          VERSION=$(basename "$VSIX_FILE" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "✓ Built: $VSIX_FILE (v$VERSION)"
+          echo "vsix_file=$VSIX_FILE" >> "$GITHUB_OUTPUT"
+          echo "✓ Built: $VSIX_FILE"
 
-      - name: Generate SHA256
+      - name: Commit and Push VSIX to current commit
         run: |
-          cd dist
-          for f in *.vsix; do
-            sha256sum "$f" | awk '{print $1}' > "${f}.sha256"
-          done
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
 
-      - name: Upload VSIX artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: modified-vsix
-          path: |
-            dist/*.vsix
-            dist/*.sha256
-          retention-days: 30
+          VSIX_FILE=$(ls dist/augment-vscode-modified-v*.vsix | head -1)
+          VSIX_NAME=$(basename "$VSIX_FILE")
 
-  # ── 3. Build Rust Proxy (macOS / Windows / Linux ARM) ─────
-  build-proxy:
-    needs: check-version
-    if: needs.check-version.outputs.should_build == 'true'
-    name: Proxy (${{ matrix.label }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            bin: augment-byok-proxy
-            label: macOS-arm64
-            archive: augment-byok-proxy-macos-aarch64.tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: augment-byok-proxy.exe
-            label: Windows-x64
-            archive: augment-byok-proxy-windows-x86_64.zip
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            bin: augment-byok-proxy
-            label: Linux-arm64
-            archive: augment-byok-proxy-linux-aarch64.tar.gz
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build (release)
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          set -euxo pipefail
-          mkdir -p dist/pkg
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/pkg/
-          cp config.example.yaml dist/pkg/config.yaml
-          cp README.md dist/pkg/
-          (cd dist && tar -czf "${{ matrix.archive }}" -C pkg .)
-          sha256sum "dist/${{ matrix.archive }}" | awk '{print $1}' > "dist/${{ matrix.archive }}.sha256"
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/pkg | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/pkg/ -Force
-          Copy-Item config.example.yaml dist/pkg/config.yaml -Force
-          Copy-Item README.md dist/pkg/ -Force
-          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/${{ matrix.archive }}" -Force
-          (Get-FileHash "dist/${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower() | Out-File -Encoding ascii "dist/${{ matrix.archive }}.sha256"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: proxy-${{ matrix.label }}
-          path: |
-            dist/${{ matrix.archive }}
-            dist/${{ matrix.archive }}.sha256
-          if-no-files-found: error
-          retention-days: 30
-
-  # ── 4. GitHub Release (versioned + rolling) ────────────────
-  release:
-    name: Release
-    needs: [check-version, build-vsix, build-proxy]
-    if: needs.check-version.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.build-vsix.outputs.version }}
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: List artifacts
-        run: ls -lhR dist
-
-      - name: Create versioned release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: "vsix-v${{ env.VERSION }}"
-          name: "v${{ env.VERSION }}"
-          prerelease: false
-          allowUpdates: true
-          replacesArtifacts: true
-          body: |
-            ## Auto-built from Marketplace stable release
-
-            **VSIX Version:** `v${{ env.VERSION }}` (from `augment.vscode-augment`)
-            **Commit:** `${{ github.sha }}`
-
-            ### What's included
-            - `augment-vscode-modified-v${{ env.VERSION }}.vsix` — Injected extension (BYOK Proxy Panel + Auth Header + Interceptor)
-            - `augment-byok-proxy-macos-aarch64.tar.gz` — Proxy binary for macOS ARM64
-            - `augment-byok-proxy-windows-x86_64.zip` — Proxy binary for Windows x64
-            - `augment-byok-proxy-linux-aarch64.tar.gz` — Proxy binary for Linux ARM64 (Oracle Cloud)
-
-            ### VSIX Installation
-            1. Download the `.vsix` file below
-            2. VS Code → Extensions → `⋯` → **Install from VSIX…**
-            3. Select the downloaded file
-
-            ### Proxy Installation
-            1. Download the archive for your OS
-            2. Extract, edit `config.yaml`
-            3. Run `./augment-byok-proxy`
-          artifacts: |
-            dist/*.vsix
-            dist/*.vsix.sha256
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-            dist/*.zip
-            dist/*.zip.sha256
-
-      - name: Update rolling release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: rolling
-          name: "Latest (v${{ env.VERSION }})"
-          prerelease: true
-          allowUpdates: true
-          replacesArtifacts: true
-          body: |
-            ⚡ **Latest build** — auto-updated when a new stable Marketplace version is detected.
-
-            - **VSIX:** `augment.vscode-augment` v${{ env.VERSION }}
-            - **Proxy:** macOS ARM64, Windows x64, Linux ARM64
-            - **Commit:** ${{ github.sha }}
-
-            > For a specific version, see [Releases](../../releases) for `vsix-v*` tags.
-          artifacts: |
-            dist/*.vsix
-            dist/*.vsix.sha256
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-            dist/*.zip
-            dist/*.zip.sha256
+          git add "$VSIX_FILE"
+          git commit -m "chore: add Windows VSIX - $VSIX_NAME" || echo "No changes to commit"
+          git push
