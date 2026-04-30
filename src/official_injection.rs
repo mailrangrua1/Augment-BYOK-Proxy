@@ -5,9 +5,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::config::Config;
-use crate::protocol::{
-  AugmentBlobs, AugmentRequest, NodeIn, TextNode, REQUEST_NODE_TEXT,
-};
+use crate::protocol::{AugmentBlobs, AugmentRequest, NodeIn, TextNode, REQUEST_NODE_TEXT};
 use crate::util::{join_url, normalize_raw_token, now_ms};
 use crate::AppState;
 
@@ -261,7 +259,10 @@ async fn maybe_inject_official_codebase_retrieval(
   let base_blobs = normalize_blobs(req.blobs.as_ref());
   let user_guided = normalize_string_list(&req.user_guided_blobs, 500);
 
-  let has_checkpoint = base_blobs.checkpoint_id.as_deref().is_some_and(|s| !s.is_empty());
+  let has_checkpoint = base_blobs
+    .checkpoint_id
+    .as_deref()
+    .is_some_and(|s| !s.is_empty());
   let has_added = !base_blobs.added_blobs.is_empty();
   let has_deleted = !base_blobs.deleted_blobs.is_empty();
   let has_user_guided = !user_guided.is_empty();
@@ -289,7 +290,16 @@ async fn maybe_inject_official_codebase_retrieval(
     "enable_commit_retrieval": false,
   });
 
-  match fetch_official_codebase_retrieval(state, completion_url, &api_token, payload, payload_base, timeout).await {
+  match fetch_official_codebase_retrieval(
+    state,
+    completion_url,
+    &api_token,
+    payload,
+    payload_base,
+    timeout,
+  )
+  .await
+  {
     Ok(formatted) => {
       let formatted = formatted.trim();
       if formatted.is_empty() {
@@ -490,10 +500,7 @@ fn normalize_official_context_canvas_list_response(raw: &Value) -> (Vec<ContextC
   let mut canvases: Vec<ContextCanvas> = Vec::new();
   for it in list {
     let Some(o) = it.as_object() else { continue };
-    let id = get_string_any(
-      o,
-      &["canvas_id", "canvasId", "canvasID", "id"],
-    );
+    let id = get_string_any(o, &["canvas_id", "canvasId", "canvasID", "id"]);
     let name = get_string_any(o, &["name", "title"]);
     let description = get_string_any(o, &["description", "summary"]);
     if id.is_empty() && name.is_empty() && description.is_empty() {
@@ -549,7 +556,11 @@ fn format_context_canvas_for_prompt(canvas: &ContextCanvas, canvas_id: &str) -> 
   lines.join("\n").trim().to_string()
 }
 
-fn inject_context_canvas_node(req: &mut AugmentRequest, canvas: ContextCanvas, canvas_id: &str) -> bool {
+fn inject_context_canvas_node(
+  req: &mut AugmentRequest,
+  canvas: ContextCanvas,
+  canvas_id: &str,
+) -> bool {
   let text = format_context_canvas_for_prompt(&canvas, canvas_id);
   if text.is_empty() {
     return false;
@@ -562,7 +573,11 @@ fn inject_context_canvas_node(req: &mut AugmentRequest, canvas: ContextCanvas, c
   } else {
     target.push(node);
   }
-  debug!(chars = text.len(), target_len = target.len(), "officialContextCanvas injected");
+  debug!(
+    chars = text.len(),
+    target_len = target.len(),
+    "officialContextCanvas injected"
+  );
   true
 }
 
@@ -598,10 +613,13 @@ async fn upsert_canvas_cache(state: &AppState, completion_url: &str, canvases: V
   let now = now_ms();
   let expires_at_ms = now.saturating_add(CONTEXT_CANVAS_CACHE_TTL_MS);
   let mut cache = state.context_canvas_cache.write().await;
-  let entry = cache.by_base_url.entry(key).or_insert_with(|| ContextCanvasCacheEntry {
-    expires_at_ms,
-    by_id: HashMap::new(),
-  });
+  let entry = cache
+    .by_base_url
+    .entry(key)
+    .or_insert_with(|| ContextCanvasCacheEntry {
+      expires_at_ms,
+      by_id: HashMap::new(),
+    });
   for c in canvases {
     if c.id.trim().is_empty() {
       continue;
@@ -675,7 +693,15 @@ async fn maybe_inject_official_external_sources(
   let mut wanted_ids = explicit_ids.clone();
   if wanted_ids.is_empty() && should_auto {
     let implicit_timeout = Duration::from_millis(implicit_timeout_ms);
-    match fetch_official_implicit_external_sources(state, completion_url, &api_token, msg, implicit_timeout).await {
+    match fetch_official_implicit_external_sources(
+      state,
+      completion_url,
+      &api_token,
+      msg,
+      implicit_timeout,
+    )
+    .await
+    {
       Ok(raw) => {
         let implicit_ids = normalize_external_source_ids_from_implicit_result(&raw);
         if !implicit_ids.is_empty() {
@@ -725,10 +751,14 @@ async fn maybe_inject_official_external_sources(
     .cloned()
     .filter(|r| !r.id.is_empty() && wanted_set.contains(&r.id))
     .collect();
-  let chosen: Vec<ExternalSource> = (if !filtered.is_empty() { filtered } else { results })
-    .into_iter()
-    .take(6)
-    .collect();
+  let chosen: Vec<ExternalSource> = (if !filtered.is_empty() {
+    filtered
+  } else {
+    results
+  })
+  .into_iter()
+  .take(6)
+  .collect();
 
   let text = format_external_sources_for_prompt(&chosen, &wanted_ids);
   if text.is_empty() {
@@ -742,7 +772,11 @@ async fn maybe_inject_official_external_sources(
   } else {
     target.push(node);
   }
-  debug!(chars = text.len(), target_len = target.len(), "officialExternalSources injected");
+  debug!(
+    chars = text.len(),
+    target_len = target.len(),
+    "officialExternalSources injected"
+  );
   true
 }
 

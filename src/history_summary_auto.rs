@@ -1368,8 +1368,8 @@ pub async fn maybe_summarize_and_compact(
       } else {
         hs.provider_id.as_str()
       };
-      let provider = get_byok_provider_by_id(cfg, provider_id)
-        .context("history_summary.provider_id 无效")?;
+      let provider =
+        get_byok_provider_by_id(cfg, provider_id).context("history_summary.provider_id 无效")?;
 
       let mut used_rolling = false;
       let mut prompt = hs.prompt.clone();

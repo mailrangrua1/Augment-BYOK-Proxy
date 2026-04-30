@@ -2778,7 +2778,10 @@ mod parse_tests {
     let req = parse_augment_request(body).unwrap();
     assert_eq!(req.disable_retrieval, true);
     assert_eq!(req.disable_auto_external_sources, true);
-    assert_eq!(req.external_source_ids, vec!["s1".to_string(), "s2".to_string()]);
+    assert_eq!(
+      req.external_source_ids,
+      vec!["s1".to_string(), "s2".to_string()]
+    );
     assert_eq!(req.user_guided_blobs, vec!["b1".to_string()]);
     assert_eq!(req.canvas_id, "c1".to_string());
     assert_eq!(req.message_source, "prompt".to_string());
