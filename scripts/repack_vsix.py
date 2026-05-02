@@ -14,6 +14,13 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+# Ensure UTF-8 stdout/stderr on Windows (cp1252 default breaks emoji/CJK output)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 MARKETPLACE_VSIX_URL = (
     "https://marketplace.visualstudio.com/_apis/public/gallery/"
