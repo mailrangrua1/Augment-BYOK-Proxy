@@ -101,7 +101,7 @@ jobs:
         run: |
           python3 scripts/repack_vsix.py --force
           VSIX_FILE=$(ls dist/augment-vscode-modified-v*.vsix | head -1)
-          VERSION=$(basename "$VSIX_FILE" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+')
+          VERSION=$(basename "$VSIX_FILE" | sed -E 's/.*-v([0-9]+\.[0-9]+\.[0-9]+)\.vsix/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "vsix_file=$VSIX_FILE" >> "$GITHUB_OUTPUT"
           echo "✓ Built: $VSIX_FILE"
