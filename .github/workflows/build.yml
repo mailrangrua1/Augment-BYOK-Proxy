@@ -1,14 +1,91 @@
-name: Build & Update VSIX
+name: Auto Build & Release VSIX
 
 permissions:
   contents: write
 
 on:
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
-  build-vsix:
+  check-version:
     runs-on: ubuntu-latest
+    outputs:
+      marketplace_version: ${{ steps.check.outputs.marketplace_version }}
+      skip: ${{ steps.should_build.outputs.skip }}
+    steps:
+      - name: Get latest Marketplace version
+        id: check
+        run: |
+          VERSION=$(python3 - <<'EOF'
+          import json, urllib.request
+          url = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery"
+          body = json.dumps({
+              "filters": [{"criteria": [
+                  {"filterType": 7, "value": "augment.vscode-augment"}
+              ]}],
+              # 0x200 (IncludeLatestVersionOnly) | 0x80 (IncludeAssetUri) | 0x2 (IncludeVersions)
+              "flags": 0x200 | 0x80 | 0x2,
+          }).encode("utf-8")
+          req = urllib.request.Request(
+              url,
+              data=body,
+              headers={
+                  "Accept": "application/json;api-version=3.0-preview.1",
+                  "Content-Type": "application/json",
+                  "User-Agent": "vsix-checker/1.0",
+              },
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  data = json.load(resp)
+              versions = data["results"][0]["extensions"][0]["versions"]
+              # Pick first non-prerelease version (Marketplace returns latest first).
+              version = ""
+              for v in versions:
+                  props = {p.get("key"): p.get("value") for p in v.get("properties", [])}
+                  if props.get("Microsoft.VisualStudio.Code.PreRelease", "false").lower() == "true":
+                      continue
+                  version = v.get("version", "")
+                  break
+              if not version and versions:
+                  version = versions[0].get("version", "")
+              print(version)
+          except Exception as exc:
+              import sys
+              print(f"ERROR: {exc}", file=sys.stderr)
+              print("")
+          EOF
+          )
+          echo "marketplace_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Marketplace version: $VERSION"
+
+      - name: Check if version already released
+        id: should_build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.check.outputs.marketplace_version }}"
+          if [ -z "$VERSION" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Version fetch failed, skipping."
+            exit 0
+          fi
+          EXISTING=$(gh release view vsix-rolling --json assets --jq '.assets[].name' 2>/dev/null || echo "")
+          if echo "$EXISTING" | grep -q "augment-vscode-modified-v${VERSION}.vsix"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION already released, skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "New version $VERSION detected, will build."
+          fi
+
+  build-vsix:
+    needs: check-version
+    if: needs.check-version.outputs.skip == 'false'
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,8 +97,8 @@ jobs:
 
       - name: Build modified VSIX
         id: build
+        shell: bash
         run: |
-          set -euo pipefail
           python3 scripts/repack_vsix.py --force
           VSIX_FILE=$(ls dist/augment-vscode-modified-v*.vsix | head -1)
           VERSION=$(basename "$VSIX_FILE" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+')
@@ -29,14 +106,70 @@ jobs:
           echo "vsix_file=$VSIX_FILE" >> "$GITHUB_OUTPUT"
           echo "✓ Built: $VSIX_FILE"
 
-      - name: Commit and Push VSIX to current commit
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ steps.build.outputs.version }}
+          path: ${{ steps.build.outputs.vsix_file }}
+          retention-days: 1
+
+  release:
+    needs: [check-version, build-vsix]
+    if: needs.check-version.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download VSIX artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vsix-${{ needs.check-version.outputs.marketplace_version }}
+          path: dist/
+
+      - name: Update rolling release (keep 3 latest VSIX)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check-version.outputs.marketplace_version }}
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          set -euo pipefail
+          VSIX_FILE="dist/augment-vscode-modified-v${VERSION}.vsix"
+          COMMIT=$(git rev-parse HEAD)
 
-          VSIX_FILE=$(ls dist/augment-vscode-modified-v*.vsix | head -1)
-          VSIX_NAME=$(basename "$VSIX_FILE")
+          # Get existing VSIX assets sorted by version (oldest first)
+          EXISTING_VSIX=$(gh release view vsix-rolling --json assets \
+            --jq '.assets[].name' 2>/dev/null \
+            | grep 'augment-vscode-modified-v.*\.vsix$' \
+            | grep -v "\.sha256$" \
+            | sort -V || true)
 
-          git add "$VSIX_FILE"
-          git commit -m "chore: add Windows VSIX - $VSIX_NAME" || echo "No changes to commit"
-          git push
+          # Keep only 2 newest so that new one makes 3 total
+          if [ -n "$EXISTING_VSIX" ]; then
+            COUNT=$(echo "$EXISTING_VSIX" | wc -l | tr -d ' ')
+            if [ "$COUNT" -ge 3 ]; then
+              TO_DELETE=$(echo "$EXISTING_VSIX" | head -n $(( COUNT - 2 )))
+              for asset in $TO_DELETE; do
+                echo "Deleting old asset: $asset"
+                gh release delete-asset vsix-rolling "$asset" --yes 2>/dev/null || true
+              done
+            fi
+          fi
+
+          # Build simple release notes
+          BODY=$(printf '**VSIX Version:** v%s\n**Commit:** %s' "$VERSION" "$COMMIT")
+
+          # Create or update the rolling release
+          if gh release view vsix-rolling > /dev/null 2>&1; then
+            gh release edit vsix-rolling \
+              --title "v${VERSION}" \
+              --notes "$BODY"
+          else
+            gh release create vsix-rolling \
+              --title "v${VERSION}" \
+              --notes "$BODY" \
+              --latest
+          fi
+
+          # Upload new VSIX
+          gh release upload vsix-rolling "$VSIX_FILE" --clobber
+          echo "✓ Released: augment-vscode-modified-v${VERSION}.vsix"
