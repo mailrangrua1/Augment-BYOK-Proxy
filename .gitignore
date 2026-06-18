@@ -2,6 +2,29 @@
 /dist/
 .cargo-home/
 config.yaml
+remote_config.yaml
+history_summary_cache.json
 *.log
 
+# Local SSH helper / VS Code workspace settings (not for upstream)
+_try_ssh.ps1
+.vscode/
+
+# Local downloaded VSIX artifacts
+augment-vscode-modified-v*.vsix
+
+# Temporary scripts/files used during interactive debugging
+.tmp_*
+
 __pycache__/
+
+# ─── Local test / debug scripts ──────────────────────────────────────────────
+# These may contain local tokens, IPs, or service-specific paths.
+# Keep on disk for local use but NEVER commit to a public repo.
+diag.sh
+fix_gcli2api.sh
+patch_safety.sh
+test_models.sh
+test_remote.sh
+scripts/_*.txt
+scripts/_*.py
