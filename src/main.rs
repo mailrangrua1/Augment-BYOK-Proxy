@@ -6,9 +6,16 @@ mod history_summary_auto;
 mod official_injection;
 mod openai;
 mod protocol;
+mod thread_store;
 mod util;
 
-use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+  collections::{BTreeMap, HashMap},
+  convert::Infallible,
+  path::PathBuf,
+  sync::Arc,
+  time::Duration,
+};
 
 use anyhow::Context;
 use async_stream::stream;
@@ -39,6 +46,7 @@ use crate::{
   official_injection::{maybe_inject_official_context, ContextCanvasCache},
   openai::OpenAIChatCompletionChunk,
   protocol::{error_response, probe_response, AugmentRequest, AugmentStreamChunk},
+  thread_store::{ingest_node_out, SharedThreadStore, ThreadStore, TurnSnapshot},
   util::{join_url, normalize_raw_token, now_ms},
 };
 
@@ -94,6 +102,8 @@ struct AppState {
   context_canvas_cache: Arc<RwLock<ContextCanvasCache>>,
   history_summary_cache: Arc<RwLock<HistorySummaryCache>>,
   history_summary_cache_path: PathBuf,
+  thread_store: SharedThreadStore,
+  thread_store_path: PathBuf,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -120,7 +130,7 @@ struct ModelCacheEntry {
   models: Vec<String>,
 }
 
-const ADMIN_HTML: &str = r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Augment-BYOK-Proxy Admin</title><style>body{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei";margin:24px;max-width:980px}textarea{width:100%;min-height:420px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:12px}button{margin-right:8px;padding:8px 12px}small{color:#666}pre{background:#111;color:#eee;padding:12px;white-space:pre-wrap}</style></head><body><h1>Augment-BYOK-Proxy Admin</h1><p><small>说明：此页面直接编辑运行时配置（JSON）。<b>不支持</b>通过此接口热更新 <code>server.host/server.port</code> / <code>logging.filter</code>（需要重启进程）。</small></p><div style="margin:12px 0"><button id="reload">刷新</button><button id="apply">应用(热更新)</button><button id="save">保存到文件</button></div><textarea id="cfg" spellcheck="false"></textarea><h2>状态</h2><pre id="status">ready</pre><script>const $=s=>document.querySelector(s);const setStatus=(v)=>{$('#status').textContent=typeof v==='string'?v:JSON.stringify(v,null,2)};async function load(){setStatus('loading...');const r=await fetch('/admin/api/config');const t=await r.text();if(!r.ok){setStatus({ok:false,status:r.status,body:t});return}try{$('#cfg').value=JSON.stringify(JSON.parse(t),null,2);setStatus({ok:true})}catch(e){$('#cfg').value=t;setStatus({ok:false,error:'config JSON parse failed',detail:String(e)})}}async function apply(){let obj;try{obj=JSON.parse($('#cfg').value)}catch(e){setStatus({ok:false,error:'invalid JSON',detail:String(e)});return}setStatus('applying...');const r=await fetch('/admin/api/config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(obj)});const j=await r.json().catch(async()=>({ok:false,body:await r.text()}));setStatus(j);if(r.ok)await load()}async function save(){setStatus('saving...');const r=await fetch('/admin/api/config/save',{method:'POST'});const j=await r.json().catch(async()=>({ok:false,body:await r.text()}));setStatus(j)}$('#reload').addEventListener('click',load);$('#apply').addEventListener('click',apply);$('#save').addEventListener('click',save);load();</script></body></html>"#;
+const ADMIN_HTML: &str = r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Augment-BYOK-Proxy Admin</title><style>body{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei";margin:24px;max-width:980px}textarea{width:100%;min-height:420px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:12px}button{margin-right:8px;padding:8px 12px}small{color:#666}pre{background:#111;color:#eee;padding:12px;white-space:pre-wrap}#login-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:999}#login-box{background:#fff;padding:32px 40px;border-radius:10px;min-width:320px;box-shadow:0 4px 32px rgba(0,0,0,0.25)}#login-box h2{margin-top:0}#login-box input{width:100%;padding:8px 10px;font-size:15px;margin:8px 0 16px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px}#login-err{color:red;font-size:13px;min-height:18px}</style></head><body><div id="login-overlay"><div id="login-box"><h2>Admin Login</h2><label>Token (proxy.auth_token)</label><input id="tok" type="password" placeholder="Enter auth token" autocomplete="current-password"/><div id="login-err"></div><button id="login-btn" style="width:100%;padding:10px;font-size:15px">Login</button></div></div><h1>Augment-BYOK-Proxy Admin</h1><p><small>说明：此页面直接编辑运行时配置（JSON）。<b>不支持</b>通过此接口热更新 <code>server.host/server.port</code> / <code>logging.filter</code>（需要重启进程）。</small></p><div style="margin:12px 0"><button id="reload">刷新</button><button id="apply">应用(热更新)</button><button id="save">保存到文件</button><button id="logout" style="float:right;background:#e44;color:#fff">退出登录</button></div><textarea id="cfg" spellcheck="false"></textarea><h2>状态</h2><pre id="status">ready</pre><script>const $=s=>document.querySelector(s);const STORE_KEY='byok_admin_token';function getToken(){return localStorage.getItem(STORE_KEY)||''}function authHeaders(extra){return Object.assign({'x-api-key':getToken()},extra)}const setStatus=(v)=>{$('#status').textContent=typeof v==='string'?v:JSON.stringify(v,null,2)};function showLogin(err){$('#login-overlay').style.display='flex';if(err)$('#login-err').textContent=err}function hideLogin(){$('#login-overlay').style.display='none'}async function tryLogin(){const tok=$('#tok').value.trim();if(!tok){$('#login-err').textContent='请输入 token';return}const r=await fetch('/admin/api/config',{headers:{'x-api-key':tok}});if(r.status===401){$('#login-err').textContent='Token 错误，请重试';return}localStorage.setItem(STORE_KEY,tok);hideLogin();load()}async function load(){setStatus('loading...');const r=await fetch('/admin/api/config',{headers:authHeaders()});if(r.status===401){showLogin('登录已过期，请重新输入 token');return}const t=await r.text();if(!r.ok){setStatus({ok:false,status:r.status,body:t});return}try{$('#cfg').value=JSON.stringify(JSON.parse(t),null,2);setStatus({ok:true})}catch(e){$('#cfg').value=t;setStatus({ok:false,error:'config JSON parse failed',detail:String(e)})}}async function apply(){let obj;try{obj=JSON.parse($('#cfg').value)}catch(e){setStatus({ok:false,error:'invalid JSON',detail:String(e)});return}setStatus('applying...');const r=await fetch('/admin/api/config',{method:'PUT',headers:authHeaders({'content-type':'application/json'}),body:JSON.stringify(obj)});if(r.status===401){showLogin('登录已过期');return}const j=await r.json().catch(async()=>({ok:false,body:await r.text()}));setStatus(j);if(r.ok)await load()}async function save(){setStatus('saving...');const r=await fetch('/admin/api/config/save',{method:'POST',headers:authHeaders()});if(r.status===401){showLogin('登录已过期');return}const j=await r.json().catch(async()=>({ok:false,body:await r.text()}));setStatus(j)}$('#login-btn').addEventListener('click',tryLogin);$('#tok').addEventListener('keydown',e=>{if(e.key==='Enter')tryLogin()});$('#reload').addEventListener('click',load);$('#apply').addEventListener('click',apply);$('#save').addEventListener('click',save);$('#logout').addEventListener('click',()=>{localStorage.removeItem(STORE_KEY);showLogin('')});if(getToken()){load()}else{showLogin('')}</script></body></html>"#;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -145,6 +155,26 @@ async fn main() -> anyhow::Result<()> {
       }
     };
 
+  let thread_store_path = args.config.with_file_name("thread_store.json");
+  let thread_store_data = match ThreadStore::load_from_file(&thread_store_path).await {
+    Ok(v) => {
+      info!(
+        cache_path=%thread_store_path.display(),
+        threads=v.threads.len(),
+        "thread store 已加载（恢复历史 chat_history）"
+      );
+      v
+    }
+    Err(err) => {
+      warn!(
+        error=%err,
+        cache_path=%thread_store_path.display(),
+        "thread store 读取失败（将使用空缓存）"
+      );
+      ThreadStore::default()
+    }
+  };
+
   let state = AppState {
     config_path: args.config,
     cfg: Arc::new(RwLock::new(cfg)),
@@ -153,6 +183,8 @@ async fn main() -> anyhow::Result<()> {
     context_canvas_cache: Arc::new(RwLock::new(ContextCanvasCache::default())),
     history_summary_cache: Arc::new(RwLock::new(history_summary_cache)),
     history_summary_cache_path,
+    thread_store: Arc::new(RwLock::new(thread_store_data)),
+    thread_store_path,
   };
 
   let app = Router::new()
@@ -174,6 +206,13 @@ async fn main() -> anyhow::Result<()> {
     )
     .route("/chat-stream", post(chat_stream))
     .route("/get-models", post(get_models))
+    // Blob-sync endpoints: Sidecar dùng để upload/check file context lên server.
+    // BYOK proxy không cần blob storage → trả về "tất cả đã có" / "thành công"
+    // để tránh lỗi 402 Payment Required từ server chính thức.
+    .route("/find-missing", post(find_missing))
+    .route("/upload-blobs", post(upload_blobs_stub))
+    .route("/upload-blob", post(upload_blobs_stub))
+    .route("/record-request-events", post(record_request_events_stub))
     .route("/admin", get(admin_index))
     .route(
       "/admin/api/config",
@@ -204,17 +243,29 @@ async fn health() -> impl IntoResponse {
   axum::Json(serde_json::json!({ "status": "ok", "service": "augment-byok-proxy" }))
 }
 
-async fn admin_index() -> impl IntoResponse {
-  Html(ADMIN_HTML)
+async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+  let cfg = state.cfg.read().await;
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    return Html(ADMIN_HTML).into_response();
+  }
+  Html(ADMIN_HTML).into_response()
 }
 
-async fn admin_get_config(State(state): State<AppState>) -> impl IntoResponse {
+async fn admin_get_config(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
   let cfg = state.cfg.read().await.clone();
-  axum::Json(cfg)
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    return (
+      StatusCode::UNAUTHORIZED,
+      axum::Json(serde_json::json!({ "ok": false, "error": "未授权：缺少或错误的 token" })),
+    )
+      .into_response();
+  }
+  axum::Json(cfg).into_response()
 }
 
 async fn admin_put_config(
   State(state): State<AppState>,
+  headers: HeaderMap,
   axum::Json(next): axum::Json<Config>,
 ) -> impl IntoResponse {
   if let Err(err) = next.validate() {
@@ -224,6 +275,12 @@ async fn admin_put_config(
     );
   }
   let current = state.cfg.read().await.clone();
+  if !is_authorized(&headers, &current.proxy.auth_token) {
+    return (
+      StatusCode::UNAUTHORIZED,
+      axum::Json(serde_json::json!({ "ok": false, "error": "未授权：缺少或错误的 token" })),
+    );
+  }
   if next.server.host != current.server.host || next.server.port != current.server.port {
     return (
       StatusCode::BAD_REQUEST,
@@ -247,8 +304,14 @@ async fn admin_put_config(
   )
 }
 
-async fn admin_save_config(State(state): State<AppState>) -> impl IntoResponse {
+async fn admin_save_config(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
   let cfg = state.cfg.read().await.clone();
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    return (
+      StatusCode::UNAUTHORIZED,
+      axum::Json(serde_json::json!({ "ok": false, "error": "未授权：缺少或错误的 token" })),
+    );
+  }
   if let Err(err) = cfg.save(&state.config_path) {
     return (
       StatusCode::INTERNAL_SERVER_ERROR,
@@ -263,8 +326,18 @@ async fn admin_save_config(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn admin_delete_history_summary_cache(
   State(state): State<AppState>,
+  headers: HeaderMap,
   axum::Json(req): axum::Json<AdminDeleteHistorySummaryCacheReq>,
 ) -> impl IntoResponse {
+  {
+    let cfg = state.cfg.read().await;
+    if !is_authorized(&headers, &cfg.proxy.auth_token) {
+      return (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({ "ok": false, "error": "未授权：缺少或错误的 token" })),
+      );
+    }
+  }
   let cid = req.conversation_id.trim();
   if cid.is_empty() {
     return (
@@ -298,7 +371,19 @@ async fn admin_delete_history_summary_cache(
   )
 }
 
-async fn admin_clear_history_summary_cache(State(state): State<AppState>) -> impl IntoResponse {
+async fn admin_clear_history_summary_cache(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+) -> impl IntoResponse {
+  {
+    let cfg = state.cfg.read().await;
+    if !is_authorized(&headers, &cfg.proxy.auth_token) {
+      return (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({ "ok": false, "error": "未授权：缺少或错误的 token" })),
+      );
+    }
+  }
   let snapshot = {
     let mut guard = state.history_summary_cache.write().await;
     guard.clear_all();
@@ -386,6 +471,21 @@ async fn chat_stream(
     }
   };
 
+  // FIX MẤT CONTEXT (Augment VSIX >=0.859):
+  // VSIX mới chỉ gửi 1-turn (chat_history.len=0|1) và dựa vào server-side
+  // thread state để retrieve lịch sử. Khi route qua BYOK proxy, không có
+  // thread store → BYOK provider thấy mỗi turn như cuộc hội thoại mới.
+  // Tự duy trì thread store theo conversation_id để khôi phục history.
+  let restored_count = restore_chat_history_from_thread_store(&state, &mut augment).await;
+  if restored_count > 0 {
+    info!(
+      conversation_id = augment.conversation_id.as_deref().unwrap_or(""),
+      restored_exchanges = restored_count,
+      client_chat_history_len = augment.chat_history.len() - restored_count,
+      "thread store 已恢复历史"
+    );
+  }
+
   let header_model = headers
     .get("x-byok-model")
     .or_else(|| headers.get("X-Byok-Model"))
@@ -423,10 +523,7 @@ async fn chat_stream(
     }
   };
 
-  let model_for_trigger = match provider {
-    ProviderRef::Anthropic(_) => clean_model(&raw_model),
-    ProviderRef::OpenAICompatible(_) => raw_model.trim().to_string(),
-  };
+  let model_for_trigger = resolve_provider_model(provider, &raw_model);
 
   if let Err(err) = maybe_summarize_and_compact(
     &state.http,
@@ -439,7 +536,7 @@ async fn chat_stream(
   )
   .await
   {
-    warn!(error=%err, "history_summary 自动摘要失败（已忽略，继续使用原始 chat_history）");
+    warn!(error=?err, "history_summary 自动摘要失败（已忽略，继续使用原始 chat_history）");
   }
   compact_chat_history(&mut augment.chat_history);
 
@@ -454,7 +551,17 @@ async fn chat_stream(
     ProviderRef::Anthropic(p) => Duration::from_secs(p.timeout_seconds),
     ProviderRef::OpenAICompatible(p) => Duration::from_secs(p.timeout_seconds),
   };
-  maybe_inject_official_context(&state, &cfg, &mut augment, hard_timeout).await;
+  // Tránh double-billing: ở pure BYOK mode, mặc định KHÔNG gọi Augment chính
+  // thức để inject codebase retrieval / context canvas / external sources
+  // (các call này tiêu token bên Augment). Bật lại bằng cấu hình:
+  //   byok.inject_official_context: true
+  if cfg.byok.inject_official_context {
+    maybe_inject_official_context(&state, &cfg, &mut augment, hard_timeout).await;
+  } else {
+    debug!(
+      "byok.inject_official_context=false → bỏ qua official context injection (tiết kiệm token Augment)"
+    );
+  }
 
   let tool_meta_by_name: std::collections::HashMap<String, (String, String)> = augment
     .tool_definitions
@@ -478,7 +585,7 @@ async fn chat_stream(
 
   match provider {
     ProviderRef::Anthropic(provider) => {
-      let model = clean_model(&raw_model);
+      let model = model_for_trigger.clone();
       let anthropic_req = match convert_augment_to_anthropic(provider, &augment, model) {
         Ok(v) => v,
         Err(err) => return ndjson_response(error_response(format!("⚠️ 转换请求失败: {err}"))),
@@ -552,9 +659,21 @@ async fn chat_stream(
       }
 
       let tool_meta_by_name = tool_meta_by_name.clone();
+      // Snapshot dữ liệu cần cho thread store (giữ nguyên trước khi ownership
+      // bị move vào stream! closure). conv_id rỗng → bỏ qua thread store.
+      let conv_id_for_store = augment.conversation_id.clone().unwrap_or_default();
+      let turn_request_id = pick_turn_request_id(&headers, &augment);
+      let turn_user_message = augment.message.clone();
+      let mut turn_request_nodes_snapshot: Vec<crate::protocol::NodeIn> = Vec::new();
+      turn_request_nodes_snapshot.extend(augment.nodes.iter().cloned());
+      turn_request_nodes_snapshot.extend(augment.structured_request_nodes.iter().cloned());
+      turn_request_nodes_snapshot.extend(augment.request_nodes.iter().cloned());
+      let state_for_store = state.clone();
       let stream = stream! {
         let mut state_machine = AnthropicStreamState::default();
         state_machine.tool_meta_by_name = tool_meta_by_name;
+        let mut snapshot = TurnSnapshot::new(turn_request_id, turn_user_message);
+        snapshot.snapshot_request_nodes(&turn_request_nodes_snapshot);
         let mut data_lines: usize = 0;
         let mut parsed_events: usize = 0;
         let mut emitted_chunks: usize = 0;
@@ -566,6 +685,10 @@ async fn chat_stream(
         while let Ok(Some(line)) = lines.next_line().await {
           if line.is_empty() {
             sse_event_type = None;
+            continue;
+          }
+          // SSE heartbeat/comment lines (start with ':') — bỏ qua, không bao giờ được phép parse như data.
+          if line.starts_with(':') {
             continue;
           }
           if let Some(t) = line.strip_prefix("event:") {
@@ -588,6 +711,13 @@ async fn chat_stream(
           }
 
           for chunk in convert_event_to_chunks(&mut state_machine, event) {
+            // Capture vào snapshot trước khi serialize.
+            if !chunk.text.is_empty() {
+              snapshot.append_text_delta(chunk.text.as_str());
+            }
+            for n in &chunk.nodes {
+              ingest_node_out(&mut snapshot, n);
+            }
             if let Ok(line) = serde_json::to_string(&chunk) {
               emitted_chunks += 1;
               yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
@@ -610,10 +740,16 @@ async fn chat_stream(
         }
 
         for chunk in state_machine.finalize() {
+          for n in &chunk.nodes {
+            ingest_node_out(&mut snapshot, n);
+          }
           if let Ok(line) = serde_json::to_string(&chunk) {
             yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
           }
         }
+
+        // Commit turn snapshot vào thread store. Chạy sau khi đã yield xong tất cả chunks.
+        commit_turn_snapshot_to_thread_store(&state_for_store, conv_id_for_store, snapshot).await;
       };
 
       let mut response = Response::new(Body::from_stream(stream));
@@ -628,7 +764,7 @@ async fn chat_stream(
       response
     }
     ProviderRef::OpenAICompatible(provider) => {
-      let model = raw_model.trim().to_string();
+      let model = model_for_trigger.clone();
       let openai_req = match convert_augment_to_openai_compatible(provider, &augment, model) {
         Ok(v) => v,
         Err(err) => return ndjson_response(error_response(format!("⚠️ 转换请求失败: {err}"))),
@@ -701,9 +837,19 @@ async fn chat_stream(
       }
 
       let tool_meta_by_name = tool_meta_by_name.clone();
+      let conv_id_for_store = augment.conversation_id.clone().unwrap_or_default();
+      let turn_request_id = pick_turn_request_id(&headers, &augment);
+      let turn_user_message = augment.message.clone();
+      let mut turn_request_nodes_snapshot: Vec<crate::protocol::NodeIn> = Vec::new();
+      turn_request_nodes_snapshot.extend(augment.nodes.iter().cloned());
+      turn_request_nodes_snapshot.extend(augment.structured_request_nodes.iter().cloned());
+      turn_request_nodes_snapshot.extend(augment.request_nodes.iter().cloned());
+      let state_for_store = state.clone();
       let stream = stream! {
         let mut state_machine = OpenAIStreamState::default();
         state_machine.tool_meta_by_name = tool_meta_by_name;
+        let mut snapshot = TurnSnapshot::new(turn_request_id, turn_user_message);
+        snapshot.snapshot_request_nodes(&turn_request_nodes_snapshot);
         let mut data_lines: usize = 0;
         let mut parsed_chunks: usize = 0;
         let mut emitted_chunks: usize = 0;
@@ -713,6 +859,10 @@ async fn chat_stream(
 
         while let Ok(Some(line)) = lines.next_line().await {
           if line.is_empty() {
+            continue;
+          }
+          // SSE heartbeat/comment lines (start with ':') — bỏ qua.
+          if line.starts_with(':') {
             continue;
           }
           let Some(data) = line.strip_prefix("data:") else { continue };
@@ -736,6 +886,9 @@ async fn chat_stream(
             if let Some(delta) = choice.delta.content.as_deref() {
               if !delta.is_empty() {
                 let chunk = state_machine.on_text_delta(delta);
+                if !chunk.text.is_empty() {
+                  snapshot.append_text_delta(chunk.text.as_str());
+                }
                 if let Ok(line) = serde_json::to_string(&chunk) {
                   emitted_chunks += 1;
                   yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
@@ -750,6 +903,9 @@ async fn chat_stream(
                   let name = c.function.as_ref().and_then(|f| f.name.as_deref());
                   let args = c.function.as_ref().and_then(|f| f.arguments.as_deref());
                   if let Some(chunk) = state_machine.on_tool_call_delta(idx, id, name, args) {
+                    for n in &chunk.nodes {
+                      ingest_node_out(&mut snapshot, n);
+                    }
                     if let Ok(line) = serde_json::to_string(&chunk) {
                       emitted_chunks += 1;
                       yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
@@ -762,6 +918,9 @@ async fn chat_stream(
                 let name = fc.name.as_deref();
                 let args = fc.arguments.as_deref();
                 if let Some(chunk) = state_machine.on_tool_call_delta(0, None, name, args) {
+                  for n in &chunk.nodes {
+                    ingest_node_out(&mut snapshot, n);
+                  }
                   if let Ok(line) = serde_json::to_string(&chunk) {
                     emitted_chunks += 1;
                     yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
@@ -787,10 +946,15 @@ async fn chat_stream(
         }
 
         for chunk in state_machine.finalize() {
+          for n in &chunk.nodes {
+            ingest_node_out(&mut snapshot, n);
+          }
           if let Ok(line) = serde_json::to_string(&chunk) {
             yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
           }
         }
+
+        commit_turn_snapshot_to_thread_store(&state_for_store, conv_id_for_store, snapshot).await;
       };
 
       let mut response = Response::new(Body::from_stream(stream));
@@ -874,9 +1038,33 @@ fn build_user_text(body: &serde_json::Value) -> String {
     .map(|arr| arr.iter().any(|x| x.is_object()))
     .unwrap_or(false);
 
-  let message = json_string(body.get("message"));
-  let prompt = json_string(body.get("prompt"));
-  let instruction = json_string(body.get("instruction"));
+  // Hỗ trợ thêm các tên field mà /prompt-enhancer & /chat-input-completion
+  // (vsix mới) có thể dùng cho phần "chat input hiện tại". Nếu thiếu các alias
+  // này, BYOK sẽ nhận user_text rỗng → output kém / extension abort.
+  let message = first_non_empty_string(
+    body,
+    &[
+      "message",
+      "text",
+      "input",
+      "current_input",
+      "currentInput",
+      "current_text",
+      "currentText",
+      "chat_input",
+      "chatInput",
+      "partial_input",
+      "partialInput",
+      "user_input",
+      "userInput",
+      "query",
+    ],
+  );
+  let prompt = first_non_empty_string(
+    body,
+    &["prompt", "prompt_text", "promptText", "user_prompt"],
+  );
+  let instruction = first_non_empty_string(body, &["instruction", "instructions"]);
 
   let use_message = !message.is_empty() && !is_placeholder_message(&message);
   let use_prompt = !use_message && !prompt.is_empty();
@@ -913,6 +1101,16 @@ fn build_user_text(body: &serde_json::Value) -> String {
     parts.push(diff);
   }
   parts.join("\n\n").trim().to_string()
+}
+
+fn first_non_empty_string(body: &serde_json::Value, keys: &[&str]) -> String {
+  for k in keys {
+    let s = json_string(body.get(*k));
+    if !s.is_empty() {
+      return s;
+    }
+  }
+  String::new()
 }
 
 fn read_model_from_body(body: &serde_json::Value) -> Option<String> {
@@ -957,11 +1155,40 @@ fn pick_provider_and_model_for_simple<'a>(
     }
   };
 
-  let model = match provider {
-    ProviderRef::Anthropic(_) => clean_model(&raw_model),
-    ProviderRef::OpenAICompatible(_) => raw_model.trim().to_string(),
-  };
+  let model = resolve_provider_model(provider, &raw_model);
   Ok((provider, model))
+}
+
+fn resolve_model_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
+  let trimmed = model.trim();
+  if trimmed.is_empty() {
+    return String::new();
+  }
+  aliases
+    .get(trimmed)
+    .map(|v| v.trim())
+    .filter(|v| !v.is_empty())
+    .unwrap_or(trimmed)
+    .to_string()
+}
+
+fn resolve_provider_model(provider: ProviderRef<'_>, raw_model: &str) -> String {
+  match provider {
+    ProviderRef::Anthropic(p) => {
+      let cleaned = clean_model(raw_model);
+      resolve_model_alias(&cleaned, &p.model_aliases)
+    }
+    ProviderRef::OpenAICompatible(p) => resolve_model_alias(raw_model, &p.model_aliases),
+  }
+}
+
+fn anthropic_thinking_payload(provider: &AnthropicProviderConfig) -> Option<serde_json::Value> {
+  provider.thinking.enabled.then(|| {
+    serde_json::json!({
+      "type": "enabled",
+      "budget_tokens": provider.thinking.budget_tokens,
+    })
+  })
 }
 
 async fn provider_complete_text(
@@ -993,12 +1220,9 @@ async fn provider_complete_text(
           );
         }
       }
-      if p.thinking.enabled {
+      if let Some(thinking) = anthropic_thinking_payload(p) {
         if let Some(obj) = payload.as_object_mut() {
-          obj.insert(
-            "thinking".to_string(),
-            serde_json::json!({ "type": "enabled", "budget_tokens": p.thinking.budget_tokens }),
-          );
+          obj.insert("thinking".to_string(), thinking);
         }
       }
 
@@ -1191,12 +1415,9 @@ async fn byok_text_stream_endpoint(
           );
         }
       }
-      if p.thinking.enabled {
+      if let Some(thinking) = anthropic_thinking_payload(p) {
         if let Some(obj) = payload.as_object_mut() {
-          obj.insert(
-            "thinking".to_string(),
-            serde_json::json!({ "type": "enabled", "budget_tokens": p.thinking.budget_tokens }),
-          );
+          obj.insert("thinking".to_string(), thinking);
         }
       }
 
@@ -1290,6 +1511,10 @@ async fn byok_text_stream_endpoint(
     while let Ok(Some(line)) = lines.next_line().await {
       if line.is_empty() {
         anthropic_event_type = None;
+        continue;
+      }
+      // SSE heartbeat/comment lines (start with ':') — bỏ qua.
+      if line.starts_with(':') {
         continue;
       }
       if line.starts_with("event:") {
@@ -2092,6 +2317,69 @@ async fn forward_to_official(
   resp
 }
 
+// ─── Blob-sync / telemetry stubs ──────────────────────────────────────────────
+//
+// AugmentExtensionSidecar gọi các endpoint này để:
+//   /find-missing       - kiểm tra blob nào chưa có trên server (cần upload)
+//   /upload-blobs       - upload nội dung blob
+//   /record-request-events - ghi nhận usage events (telemetry)
+//
+// BYOK proxy không lưu trữ blob và không cần telemetry → trả về empty success
+// để tránh lỗi 402 Payment Required từ server chính thức và vòng retry vô hạn.
+
+async fn find_missing(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+  let cfg = state.cfg.read().await;
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    let mut resp = Response::new(Body::from(r#"{"ok":false,"error":"Unauthorized"}"#));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+    return resp;
+  }
+  drop(cfg);
+
+  // Trả về: không có blob nào bị thiếu → client dừng retry / không cần upload.
+  // Format khớp với Augment API: {"blobs": []}
+  debug!(len = body.len(), "find-missing → trả về empty (no blobs missing)");
+  let mut resp = Response::new(Body::from(r#"{"blobs":[]}"#));
+  *resp.status_mut() = StatusCode::OK;
+  resp.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+  resp
+}
+
+async fn upload_blobs_stub(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+  let cfg = state.cfg.read().await;
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    let mut resp = Response::new(Body::from(r#"{"ok":false,"error":"Unauthorized"}"#));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+    return resp;
+  }
+  drop(cfg);
+
+  debug!(len = body.len(), "upload-blobs → trả về ok (stub)");
+  let mut resp = Response::new(Body::from(r#"{"ok":true}"#));
+  *resp.status_mut() = StatusCode::OK;
+  resp.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+  resp
+}
+
+async fn record_request_events_stub(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+  let cfg = state.cfg.read().await;
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    let mut resp = Response::new(Body::from(r#"{"ok":false,"error":"Unauthorized"}"#));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+    return resp;
+  }
+  drop(cfg);
+
+  debug!(len = body.len(), "record-request-events → trả về ok (stub)");
+  let mut resp = Response::new(Body::from(r#"{"ok":true}"#));
+  *resp.status_mut() = StatusCode::OK;
+  resp.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+  resp
+}
+
 async fn proxy_fallback(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
   let (parts, body) = req.into_parts();
   let cfg = state.cfg.read().await.clone();
@@ -2168,7 +2456,33 @@ async fn maybe_delete_history_summary_cache_on_thread_delete(
     (deleted, snapshot)
   };
   if !deleted {
+    // Vẫn cố xóa thread_store dù history_summary_cache không có entry.
+    let removed_thread = {
+      let mut g = state.thread_store.write().await;
+      g.remove_conversation(cid)
+    };
+    if removed_thread {
+      let snap = state.thread_store.read().await.clone();
+      if let Err(err) = snap.save_to_file(state.thread_store_path.as_path()).await {
+        warn!(error=%err, conversation_id=%cid, "thread store 删除后持久化失败（已忽略）");
+      } else {
+        info!(conversation_id=%cid, "thread store 已随删除请求清理");
+      }
+    }
     return;
+  }
+
+  // Đồng thời xóa thread_store cho conversation này.
+  let _removed_thread = {
+    let mut g = state.thread_store.write().await;
+    g.remove_conversation(cid)
+  };
+  let thread_snapshot = state.thread_store.read().await.clone();
+  if let Err(err) = thread_snapshot
+    .save_to_file(state.thread_store_path.as_path())
+    .await
+  {
+    warn!(error=%err, conversation_id=%cid, "thread store 删除后持久化失败（已忽略）");
   }
 
   let Some(snapshot) = snapshot else {
@@ -2266,7 +2580,13 @@ fn convert_event_to_chunks(
       Vec::new()
     }
     "message_stop" => Vec::new(),
-    "error" => vec![error_response("❌ 上游返回 error event")],
+    "error" => {
+      // FIX LẶP/TRÙNG STOP: error_response đã chứa stop_reason trọn vẹn.
+      // Đánh dấu terminal_emitted để finalize() không phát thêm 1 terminal chunk
+      // → tránh client nhận 2 stop_reason (gây hiện tượng "lặp lại kết quả").
+      state.terminal_emitted = true;
+      vec![error_response("❌ 上游返回 error event")]
+    }
     _ => Vec::new(),
   }
 }
@@ -2281,6 +2601,130 @@ fn ndjson_response(chunk: AugmentStreamChunk) -> Response<Body> {
     HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
   );
   response
+}
+
+/// Khôi phục `augment.chat_history` từ thread_store nếu VSIX gửi history rỗng/thiếu.
+/// Trả về số exchange đã prepend.
+async fn restore_chat_history_from_thread_store(
+  state: &AppState,
+  augment: &mut AugmentRequest,
+) -> usize {
+  let conv_id = augment
+    .conversation_id
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(str::to_string);
+  let Some(conv_id) = conv_id else {
+    return 0;
+  };
+
+  // Lấy snapshot history từ store. Lock read ngắn.
+  let stored: Vec<crate::protocol::AugmentChatHistory> = {
+    let guard = state.thread_store.read().await;
+    let Some(entry) = guard.get(conv_id.as_str()) else {
+      return 0;
+    };
+    entry.history.clone()
+  };
+  if stored.is_empty() {
+    return 0;
+  }
+
+  // Nếu client tự gửi history dài hơn store, tin client (có thể là full-fidelity replay).
+  if augment.chat_history.len() >= stored.len() {
+    return 0;
+  }
+
+  // Dedup theo request_id: lọc các entry trong stored có request_id trùng với
+  // bất kỳ entry nào client gửi để tránh duplicate.
+  let client_ids: std::collections::HashSet<String> = augment
+    .chat_history
+    .iter()
+    .map(|h| h.request_id.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .collect();
+  let to_prepend: Vec<crate::protocol::AugmentChatHistory> = stored
+    .into_iter()
+    .filter(|h| {
+      let id = h.request_id.trim();
+      !id.is_empty() && !client_ids.contains(id)
+    })
+    .collect();
+  let count = to_prepend.len();
+  if count == 0 {
+    return 0;
+  }
+
+  // Prepend store history vào đầu chat_history. Client history (nếu có) là
+  // turn cuối / current → giữ ở tail.
+  let mut merged: Vec<crate::protocol::AugmentChatHistory> =
+    Vec::with_capacity(count + augment.chat_history.len());
+  merged.extend(to_prepend);
+  merged.append(&mut augment.chat_history);
+  augment.chat_history = merged;
+  count
+}
+
+/// Lấy request_id ưu tiên từ header `X-Request-Id`, fallback timestamp+conv.
+fn pick_turn_request_id(headers: &HeaderMap, augment: &AugmentRequest) -> String {
+  for name in [
+    "x-request-id",
+    "X-Request-Id",
+    "x-augment-request-id",
+    "x-augment-turn-id",
+    "x-turn-id",
+  ] {
+    if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+      let v = v.trim();
+      if !v.is_empty() {
+        return v.to_string();
+      }
+    }
+  }
+  // Body có thể có turn_id (vsix mới). Đọc từ raw bytes là đắt — dùng
+  // conversation_id + now_ms như fallback (luôn duy nhất tăng dần).
+  let conv = augment.conversation_id.as_deref().unwrap_or("conv");
+  format!("byok-{}-{}", conv, now_ms())
+}
+
+/// Append snapshot turn vào thread_store và persist disk (best-effort).
+async fn commit_turn_snapshot_to_thread_store(
+  state: &AppState,
+  conversation_id: String,
+  snapshot: TurnSnapshot,
+) {
+  if conversation_id.trim().is_empty() {
+    return;
+  }
+  // Bỏ snapshot rỗng (response trống + không có tool_use): không có giá trị history.
+  if snapshot.response_text.trim().is_empty() && snapshot.response_nodes.is_empty() {
+    debug!(
+      conversation_id = conversation_id.as_str(),
+      "thread store: skip empty snapshot"
+    );
+    return;
+  }
+  let request_id = snapshot.request_id.clone();
+  let exchange = snapshot.into_chat_history();
+  let now = now_ms();
+  let snapshot_for_save = {
+    let mut guard = state.thread_store.write().await;
+    guard.append_exchange(conversation_id.as_str(), exchange, now);
+    guard.clone()
+  };
+  let path = state.thread_store_path.clone();
+  // Persist async, không block client.
+  tokio::spawn(async move {
+    if let Err(err) = snapshot_for_save.save_to_file(path.as_path()).await {
+      warn!(error=%err, path=%path.display(), "thread store 持久化失败（已忽略）");
+    }
+  });
+  debug!(
+    conversation_id = conversation_id.as_str(),
+    request_id = request_id.as_str(),
+    "thread store: appended exchange"
+  );
 }
 
 fn truncate_for_log(mut s: String, max_bytes: usize) -> String {
@@ -2694,23 +3138,65 @@ fn parse_augment_request(body: &[u8]) -> anyhow::Result<AugmentRequest> {
     anyhow::bail!("检测到 encrypted_data：本 proxy 已不支持该加密包裹；请使用官方扩展版本（或升级/更换你的扩展）");
   }
   let mut deserializer = serde_json::Deserializer::from_slice(body);
-  let augment: AugmentRequest =
-    serde_path_to_error::deserialize(&mut deserializer).map_err(|err| {
+  match serde_path_to_error::deserialize::<_, AugmentRequest>(&mut deserializer) {
+    Ok(req) => Ok(req),
+    Err(err) => {
       let path = err.path().to_string();
-      let path = if path.trim().is_empty() {
+      let path_disp = if path.trim().is_empty() {
         "<root>".to_string()
       } else {
-        path
+        path.clone()
       };
       let inner = err.inner().to_string();
-      anyhow::anyhow!("字段 {path}: {inner}")
-    })?;
-  Ok(augment)
+      // Fallback: nếu lỗi do `null` không hợp kiểu (vsix mới hay gửi null cho
+      // bool/string/array), normalize toàn bộ null -> default rồi parse lại.
+      // Việc này khôi phục phiên làm việc thay vì tear stream và buộc user
+      // downgrade extension.
+      if inner.contains("invalid type: null") {
+        let mut sanitized = serde_json::Value::Object(obj.clone());
+        normalize_null_values(&mut sanitized);
+        if let Ok(req) = serde_json::from_value::<AugmentRequest>(sanitized) {
+          warn!(field=%path_disp, hint=%inner, "parse_augment_request: dùng fallback normalize null (vsix mới?)");
+          return Ok(req);
+        }
+      }
+      Err(anyhow::anyhow!("字段 {path_disp}: {inner}"))
+    }
+  }
+}
+
+/// Đệ quy thay thế tất cả `null` trong JSON object/array. Đây là middleware
+/// rất nhẹ trong-process, an toàn vì các field thực sự nhận `null` (Option<_>)
+/// vẫn deserialize tốt khi field bị xoá hoàn toàn (#[serde(default)]).
+fn normalize_null_values(v: &mut serde_json::Value) {
+  match v {
+    serde_json::Value::Object(map) => {
+      let null_keys: Vec<String> = map
+        .iter()
+        .filter(|(_, vv)| vv.is_null())
+        .map(|(k, _)| k.clone())
+        .collect();
+      for k in null_keys {
+        map.remove(&k);
+      }
+      for (_k, vv) in map.iter_mut() {
+        normalize_null_values(vv);
+      }
+    }
+    serde_json::Value::Array(arr) => {
+      for item in arr.iter_mut() {
+        normalize_null_values(item);
+      }
+    }
+    _ => {}
+  }
 }
 
 #[cfg(test)]
 mod parse_tests {
-  use super::parse_augment_request;
+  use super::{parse_augment_request, resolve_provider_model, ProviderRef};
+  use crate::config::OpenAICompatibleProviderConfig;
+  use std::collections::BTreeMap;
 
   #[test]
   fn parse_plain_augment_request_ok() {
@@ -2778,7 +3264,10 @@ mod parse_tests {
     let req = parse_augment_request(body).unwrap();
     assert_eq!(req.disable_retrieval, true);
     assert_eq!(req.disable_auto_external_sources, true);
-    assert_eq!(req.external_source_ids, vec!["s1".to_string(), "s2".to_string()]);
+    assert_eq!(
+      req.external_source_ids,
+      vec!["s1".to_string(), "s2".to_string()]
+    );
     assert_eq!(req.user_guided_blobs, vec!["b1".to_string()]);
     assert_eq!(req.canvas_id, "c1".to_string());
     assert_eq!(req.message_source, "prompt".to_string());
@@ -2794,5 +3283,32 @@ mod parse_tests {
     let body = br#"{"encrypted_data":"deadbeef"}"#;
     let err = parse_augment_request(body).unwrap_err();
     assert!(err.to_string().contains("encrypted_data"));
+  }
+
+  #[test]
+  fn openai_provider_model_aliases_remap_before_forwarding() {
+    let mut aliases = BTreeMap::new();
+    aliases.insert(
+      "claude-sonnet-4-6".to_string(),
+      "claude-sonnet-4.6".to_string(),
+    );
+    let provider = OpenAICompatibleProviderConfig {
+      id: "openai".to_string(),
+      base_url: "http://127.0.0.1:4140/v1".to_string(),
+      api_key: "k".to_string(),
+      default_model: "claude-sonnet-4-6".to_string(),
+      max_tokens: 8192,
+      timeout_seconds: 120,
+      extra_headers: BTreeMap::new(),
+      model_aliases: aliases,
+    };
+
+    assert_eq!(
+      resolve_provider_model(
+        ProviderRef::OpenAICompatible(&provider),
+        "claude-sonnet-4-6"
+      ),
+      "claude-sonnet-4.6".to_string()
+    );
   }
 }

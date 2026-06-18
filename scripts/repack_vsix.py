@@ -167,6 +167,7 @@ def patch_package_json(extracted_root: Path) -> None:
 def build_header(repo_root: Path) -> str:
     header = ""
     inject_code = repo_root / "vsix-patch" / "inject-code.txt"
+    stability_code = repo_root / "vsix-patch" / "byok-proxy-stability-patch.js"
     auth_code = repo_root / "vsix-patch" / "byok-proxy-auth-header-inject.js"
     panel_code = repo_root / "vsix-patch" / "byok-proxy-panel-inject.js"
 
@@ -175,6 +176,15 @@ def build_header(repo_root: Path) -> str:
         info(f"已注入：{inject_code}")
     else:
         info(f"未找到 {inject_code}，跳过 header 注入")
+
+    # Stability patch phải chạy TRƯỚC auth/panel inject để:
+    # 1. Restore module.exports nếu inject-code.txt đã overwrite
+    # 2. Cài reload guard sớm nhất có thể
+    if stability_code.exists():
+        header += read_text(stability_code) + "\n;\n"
+        info(f"已注入：{stability_code}")
+    else:
+        info(f"未找到 {stability_code}，跳过 stability patch 注入")
 
     if not auth_code.exists():
         die(f"缺少注入文件：{auth_code}")
@@ -188,13 +198,91 @@ def build_header(repo_root: Path) -> str:
     return header
 
 
+def patch_stability_fixes(content: str) -> str:
+    """
+    Patch các vấn đề gây restart thường xuyên trong v0.890.1+.
+
+    Vấn đề 1: aee() / extractTenantId fails cho localhost URL
+    ─────────────────────────────────────────────────────────
+    v0.890.1 dùng _initializeAuthStateManager() → Ktn.requestAuthToken()
+    → aee("http://localhost:3080") để lấy tenant ID.
+    aee() chỉ trả kết quả khi hostname có ít nhất 2 components (subdomain.domain).
+    localhost → hostname.split(".") = ["localhost"] → length=1 → returns undefined
+    → requestAuthToken() throws → _updateAuthState() → AuthStateManager = AUTHENTICATION_FAILED
+    → Có thể trigger reload loop.
+
+    Fix: Cho phép aee() trả về component duy nhất (localhost, IP, etc.)
+    """
+    patched = content
+
+    # Pattern 1a: aee() - hàm helper tách tenant ID từ URL
+    # Original (fails for localhost):
+    #   aee=e=>{try{const t=new URL(e).hostname.split(".");if(t.length>1&&t[0])return t[0]}catch{return}}
+    # Patched (works for localhost, IP, custom domains):
+    #   aee=e=>{try{const t=new URL(e).hostname.split(".");if(t.length>1&&t[0])return t[0];if(t[0])return t[0]}catch{return"local"}}
+    PATTERN_AEE_ORIG = (
+        'aee=e=>{try{const t=new URL(e).hostname.split(".");'
+        'if(t.length>1&&t[0])return t[0]}catch{return}}'
+    )
+    PATTERN_AEE_PATCHED = (
+        'aee=e=>{try{const t=new URL(e).hostname.split(".");'
+        'if(t.length>1&&t[0])return t[0];'
+        'if(t[0])return t[0]}catch{return"local"}}'
+    )
+    if PATTERN_AEE_ORIG in patched:
+        patched = patched.replace(PATTERN_AEE_ORIG, PATTERN_AEE_PATCHED, 1)
+        info("已 patch: aee() tenant-ID extraction → hỗ trợ localhost/IP URL")
+    else:
+        # Thử pattern thay thế (minification có thể khác nhau giữa các version)
+        PATTERN_AEE_ALT = (
+            'aee=e=>{try{const t=new URL(e).hostname.split(".");'
+            'if(t.length>1&&t[0])return t[0]}catch{}}'
+        )
+        if PATTERN_AEE_ALT in patched:
+            patched = patched.replace(
+                PATTERN_AEE_ALT,
+                'aee=e=>{try{const t=new URL(e).hostname.split(".");'
+                'if(t.length>1&&t[0])return t[0];'
+                'if(t[0])return t[0]}catch{return"local"}}',
+                1,
+            )
+            info("已 patch (alt): aee() tenant-ID extraction → hỗ trợ localhost/IP URL")
+        else:
+            info("⚠ Không tìm thấy pattern aee() để patch (version này có thể đã OK hoặc format khác)")
+
+    # Pattern 1b: IPe() - wrapper kiểm tra kết quả aee() và throw nếu null
+    # Original: IPe=e=>{const t=aee(e);if(!t)throw new Error(`Failed to extract tenant ID from URL: ${e}`);return t}
+    # Patched: IPe=e=>{const t=aee(e);if(!t)return"local";return t}
+    PATTERN_IPE_ORIG = (
+        'IPe=e=>{const t=aee(e);'
+        'if(!t)throw new Error(`Failed to extract tenant ID from URL: ${e}`);'
+        'return t}'
+    )
+    PATTERN_IPE_PATCHED = (
+        'IPe=e=>{const t=aee(e);'
+        'if(!t)return"local";'
+        'return t}'
+    )
+    if PATTERN_IPE_ORIG in patched:
+        patched = patched.replace(PATTERN_IPE_ORIG, PATTERN_IPE_PATCHED, 1)
+        info("已 patch: IPe() → không throw khi thiếu tenant ID (localhost mode)")
+    else:
+        info("⚠ Không tìm thấy pattern IPe() để patch")
+
+    return patched
+
+
 def patch_main_js(repo_root: Path, main_js: Path, *, force: bool) -> None:
     original = read_text(main_js)
     if not force and "__augment_byok_proxy_panel_injected" in original:
         die("看起来已经被注入过（命中 byok-proxy-panel 关键字）；如需强制覆盖请加 --force")
 
+    # Bước 1: Áp dụng stability patches trực tiếp lên bundle code gốc
+    patched_original = patch_stability_fixes(original)
+
+    # Bước 2: Prepend inject headers
     header = build_header(repo_root)
-    content = header + original
+    content = header + patched_original
 
     if "__augment_byok_proxy_auth_header_injected" not in content:
         die("注入失败：主入口文件里未检测到 __augment_byok_proxy_auth_header_injected")
