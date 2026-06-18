@@ -2337,10 +2337,13 @@ async fn find_missing(State(state): State<AppState>, headers: HeaderMap, body: B
   }
   drop(cfg);
 
-  // Trả về: không có blob nào bị thiếu → client dừng retry / không cần upload.
-  // Format khớp với Augment API: {"blobs": []}
-  debug!(len = body.len(), "find-missing → trả về empty (no blobs missing)");
-  let mut resp = Response::new(Body::from(r#"{"blobs":[]}"#));
+  // Trả về: không có blob nào bị thiếu / chưa index → client dừng retry.
+  // Format thực tế của Augment API (từ toFindMissingResult trong extension.js):
+  //   unknown_memory_names  = blobs chưa có trên server (cần upload)
+  //   nonindexed_blob_names = blobs đã có nhưng chưa được index
+  // Trả về cả 2 rỗng = "tất cả blobs đã tồn tại và đã index" → probe succeed.
+  debug!(len = body.len(), "find-missing → trả về all-indexed (no blobs missing)");
+  let mut resp = Response::new(Body::from(r#"{"unknown_memory_names":[],"nonindexed_blob_names":[]}"#));
   *resp.status_mut() = StatusCode::OK;
   resp.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
   resp
