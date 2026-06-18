@@ -7,6 +7,18 @@ on:
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force rebuild even if version already exists"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+  push:
+    branches: [main]
+    paths:
+      - "vsix-patch/**"
+      - "scripts/repack_vsix.py"
 
 jobs:
   check-version:
@@ -73,6 +85,16 @@ jobs:
             echo "Version fetch failed, skipping."
             exit 0
           fi
+
+          # Force rebuild khi patch files thay đổi (push trigger) hoặc input force=true
+          FORCE_INPUT="${{ github.event.inputs.force_rebuild }}"
+          EVENT_NAME="${{ github.event_name }}"
+          if [ "$FORCE_INPUT" = "true" ] || [ "$EVENT_NAME" = "push" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Force/push trigger: will rebuild v${VERSION}."
+            exit 0
+          fi
+
           EXISTING=$(gh release view vsix-rolling --json assets --jq '.assets[].name' 2>/dev/null || echo "")
           if echo "$EXISTING" | grep -q "augment-vscode-modified-v${VERSION}.vsix"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
