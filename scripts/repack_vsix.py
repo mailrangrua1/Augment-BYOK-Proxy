@@ -212,62 +212,97 @@ def patch_stability_fixes(content: str) -> str:
     → Có thể trigger reload loop.
 
     Fix: Cho phép aee() trả về component duy nhất (localhost, IP, etc.)
+
+    Vấn đề 2: IPe() throws "Failed to extract tenant ID from URL"
+    ─────────────────────────────────────────────────────────────
+    IPe() wraps aee() and throws if result is falsy → crash.
+    Fix: Return "local" instead of throwing.
     """
+    import re as _re
     patched = content
 
-    # Pattern 1a: aee() - hàm helper tách tenant ID từ URL
-    # Original (fails for localhost):
-    #   aee=e=>{try{const t=new URL(e).hostname.split(".");if(t.length>1&&t[0])return t[0]}catch{return}}
-    # Patched (works for localhost, IP, custom domains):
-    #   aee=e=>{try{const t=new URL(e).hostname.split(".");if(t.length>1&&t[0])return t[0];if(t[0])return t[0]}catch{return"local"}}
-    PATTERN_AEE_ORIG = (
-        'aee=e=>{try{const t=new URL(e).hostname.split(".");'
-        'if(t.length>1&&t[0])return t[0]}catch{return}}'
+    # ── Pattern 1a: aee() — regex-based matching ──
+    # Matches various minification styles of the tenant ID extractor function.
+    # The function name may vary (aee, bee, cee, etc.) but the body pattern is stable:
+    #   FUNC=e=>{try{const t=new URL(e).hostname.split(".");if(t.length>1&&t[0])return t[0]}catch{...}}
+    AEE_REGEX = _re.compile(
+        r'(\b[a-zA-Z_$][\w$]{0,5})='       # capture func name (group 1)
+        r'(\w)=>\{try\{const (\w)='         # param (group 2), local var (group 3)
+        r'new URL\(\2\)\.hostname\.split\("\."'
+        r'\);if\(\3\.length>1&&\3\[0\]\)'
+        r'return \3\[0\]\}'
+        r'catch\{(?:return)?\}\}'            # catch block (with or without return)
     )
-    PATTERN_AEE_PATCHED = (
-        'aee=e=>{try{const t=new URL(e).hostname.split(".");'
-        'if(t.length>1&&t[0])return t[0];'
-        'if(t[0])return t[0]}catch{return"local"}}'
-    )
-    if PATTERN_AEE_ORIG in patched:
-        patched = patched.replace(PATTERN_AEE_ORIG, PATTERN_AEE_PATCHED, 1)
-        info("已 patch: aee() tenant-ID extraction → hỗ trợ localhost/IP URL")
-    else:
-        # Thử pattern thay thế (minification có thể khác nhau giữa các version)
-        PATTERN_AEE_ALT = (
-            'aee=e=>{try{const t=new URL(e).hostname.split(".");'
-            'if(t.length>1&&t[0])return t[0]}catch{}}'
+    m_aee = AEE_REGEX.search(patched)
+    if m_aee:
+        func_name = m_aee.group(1)
+        param = m_aee.group(2)
+        local = m_aee.group(3)
+        replacement = (
+            f'{func_name}={param}=>{{try{{const {local}='
+            f'new URL({param}).hostname.split(".");'
+            f'if({local}.length>1&&{local}[0])return {local}[0];'
+            f'if({local}[0])return {local}[0]'
+            f'}}catch{{return"local"}}}}'
         )
-        if PATTERN_AEE_ALT in patched:
+        patched = patched[:m_aee.start()] + replacement + patched[m_aee.end():]
+        info(f"已 patch: {func_name}() tenant-ID extraction → hỗ trợ localhost/IP URL")
+    else:
+        # Fallback: exact string match (legacy)
+        PATTERN_AEE_ORIG = (
+            'aee=e=>{try{const t=new URL(e).hostname.split(".");'
+            'if(t.length>1&&t[0])return t[0]}catch{return}}'
+        )
+        if PATTERN_AEE_ORIG in patched:
             patched = patched.replace(
-                PATTERN_AEE_ALT,
+                PATTERN_AEE_ORIG,
                 'aee=e=>{try{const t=new URL(e).hostname.split(".");'
                 'if(t.length>1&&t[0])return t[0];'
                 'if(t[0])return t[0]}catch{return"local"}}',
                 1,
             )
-            info("已 patch (alt): aee() tenant-ID extraction → hỗ trợ localhost/IP URL")
+            info("已 patch (legacy): aee() tenant-ID extraction → hỗ trợ localhost/IP URL")
         else:
-            info("⚠ Không tìm thấy pattern aee() để patch (version này có thể đã OK hoặc format khác)")
+            info("⚠ Không tìm thấy pattern aee()/extractTenantId để patch")
 
-    # Pattern 1b: IPe() - wrapper kiểm tra kết quả aee() và throw nếu null
-    # Original: IPe=e=>{const t=aee(e);if(!t)throw new Error(`Failed to extract tenant ID from URL: ${e}`);return t}
-    # Patched: IPe=e=>{const t=aee(e);if(!t)return"local";return t}
-    PATTERN_IPE_ORIG = (
-        'IPe=e=>{const t=aee(e);'
-        'if(!t)throw new Error(`Failed to extract tenant ID from URL: ${e}`);'
-        'return t}'
+    # ── Pattern 1b: IPe() — regex-based matching ──
+    # Matches: FUNC=e=>{const t=CALLER(e);if(!t)throw new Error(`Failed to extract tenant ID from URL: ${e}`);return t}
+    IPE_REGEX = _re.compile(
+        r'(\b[a-zA-Z_$][\w$]{0,5})='       # capture func name (group 1)
+        r'(\w)=>\{const (\w)='              # param (group 2), local var (group 3)
+        r'(\b[a-zA-Z_$][\w$]{0,5})\(\2\);'  # caller func (group 4)
+        r'if\(!\3\)throw new Error\('
+        r'[`"]Failed to extract tenant ID from URL[^)]+\);'
+        r'return \3\}'
     )
-    PATTERN_IPE_PATCHED = (
-        'IPe=e=>{const t=aee(e);'
-        'if(!t)return"local";'
-        'return t}'
-    )
-    if PATTERN_IPE_ORIG in patched:
-        patched = patched.replace(PATTERN_IPE_ORIG, PATTERN_IPE_PATCHED, 1)
-        info("已 patch: IPe() → không throw khi thiếu tenant ID (localhost mode)")
+    m_ipe = IPE_REGEX.search(patched)
+    if m_ipe:
+        func_name = m_ipe.group(1)
+        param = m_ipe.group(2)
+        local = m_ipe.group(3)
+        caller = m_ipe.group(4)
+        replacement = (
+            f'{func_name}={param}=>{{const {local}={caller}({param});'
+            f'if(!{local})return"local";return {local}}}'
+        )
+        patched = patched[:m_ipe.start()] + replacement + patched[m_ipe.end():]
+        info(f"已 patch: {func_name}() → không throw khi thiếu tenant ID (localhost mode)")
     else:
-        info("⚠ Không tìm thấy pattern IPe() để patch")
+        # Fallback: exact string match (legacy)
+        PATTERN_IPE_ORIG = (
+            'IPe=e=>{const t=aee(e);'
+            'if(!t)throw new Error(`Failed to extract tenant ID from URL: ${e}`);'
+            'return t}'
+        )
+        if PATTERN_IPE_ORIG in patched:
+            patched = patched.replace(
+                PATTERN_IPE_ORIG,
+                'IPe=e=>{const t=aee(e);if(!t)return"local";return t}',
+                1,
+            )
+            info("已 patch (legacy): IPe() → không throw khi thiếu tenant ID")
+        else:
+            info("⚠ Không tìm thấy pattern IPe()/ensureTenantId để patch")
 
     return patched
 
